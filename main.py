@@ -1152,7 +1152,7 @@ class FH_UltimateBot(ctk.CTk):
 
     def recover_to_menu(self):
         self.log("尝试退回主菜单重置状态...")
-        for _ in range(30):
+        for _ in range(120):
             if not self.is_running:
                 return False
 
@@ -1168,7 +1168,7 @@ class FH_UltimateBot(ctk.CTk):
                 continue
 
             self.hw_press("esc")
-            time.sleep(2.0)
+            time.sleep(0.5)
 
         self.log("多次尝试仍未退回主菜单。")
         return False
@@ -1256,7 +1256,17 @@ class FH_UltimateBot(ctk.CTk):
         if tpl is not None:
             self.template_cache[cache_key] = tpl
         return tpl, actual_path
-
+    def load_template_gray(self, template_path):
+        actual_path = get_img_path(template_path)
+        cache_key = ("gray", actual_path)
+        if not hasattr(self, "template_gray_cache"):
+            self.template_gray_cache = {}
+        if cache_key in self.template_gray_cache:
+            return self.template_gray_cache[cache_key]
+        tpl = cv2.imread(actual_path, cv2.IMREAD_GRAYSCALE)
+        if tpl is not None:
+            self.template_gray_cache[cache_key] = tpl
+        return tpl
     def get_images_root_dir(self):
         ext_dir = os.path.join(APP_DIR, "images")
         if os.path.isdir(ext_dir):
@@ -1565,6 +1575,84 @@ class FH_UltimateBot(ctk.CTk):
         except Exception as e:
             self.log(f"find_image_with_element 异常: {e}")
             return None
+    def find_image_with_element_stable(
+        self,
+        main_path,
+        sub_path,
+        region=None,
+        main_threshold=0.60,
+        verify_threshold=0.72,
+        sub_threshold=0.70,
+        max_candidates=15
+    ):
+        if not self.is_running:
+            return None
+
+        try:
+            screen = pyautogui.screenshot(region=region)
+            screen_gray = cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2GRAY)
+
+            main_tpl = self.load_template_gray(main_path)
+            sub_tpl = self.load_template_gray(sub_path)
+
+            if main_tpl is None or sub_tpl is None:
+                return None
+
+            h_m, w_m = main_tpl.shape[:2]
+            h_s, w_s = sub_tpl.shape[:2]
+
+            if h_m > screen_gray.shape[0] or w_m > screen_gray.shape[1]:
+                return None
+
+            res_main = cv2.matchTemplate(screen_gray, main_tpl, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(res_main >= main_threshold)
+
+            if len(xs) == 0:
+                return None
+
+            candidates = [(float(res_main[y, x]), x, y) for x, y in zip(xs, ys)]
+            candidates.sort(key=lambda t: t[0], reverse=True)
+
+            checked = set()
+            checked_count = 0
+
+            for main_score, x, y in candidates:
+                key = (x // 8, y // 8)
+                if key in checked:
+                    continue
+                checked.add(key)
+
+                checked_count += 1
+                if checked_count > max_candidates:
+                    break
+
+                pad = 8
+                x1 = max(0, x - pad)
+                y1 = max(0, y - pad)
+                x2 = min(screen_gray.shape[1], x + w_m + pad)
+                y2 = min(screen_gray.shape[0], y + h_m + pad)
+
+                sub_roi = screen_gray[y1:y2, x1:x2]
+                if sub_roi.shape[0] < h_s or sub_roi.shape[1] < w_s:
+                    continue
+
+                res_sub = cv2.matchTemplate(sub_roi, sub_tpl, cv2.TM_CCOEFF_NORMED)
+                sub_score = cv2.minMaxLoc(res_sub)[1]
+
+                if main_score >= verify_threshold and sub_score >= sub_threshold:
+                    cx = x + w_m // 2
+                    cy = y + h_m // 2
+                    if region:
+                        cx += region[0]
+                        cy += region[1]
+                    return (cx, cy)
+
+            return None
+
+        except Exception as e:
+            self.log(f"⚠️ find_image_with_element_stable 识别报错: {e}")
+            return None
+    
     def find_image_with_element_multi(self, main_path, sub_path, region=None, fast_mode=True,
                                       main_threshold=0.60, like_threshold=0.75, final_threshold=0.72):
         if not self.is_running:
@@ -1662,9 +1750,70 @@ class FH_UltimateBot(ctk.CTk):
         except Exception as e:
             self.log(f"find_image_with_element_multi 异常: {e}")
             return None
+    def find_image_with_element_fast(self, main_path, sub_path, region=None, threshold=0.70, sub_threshold=0.70):
+        if not self.is_running:
+            return None
+
+        try:
+            screen = pyautogui.screenshot(region=region)
+            screen_gray = cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2GRAY)
+
+            main_tpl = self.load_template_gray(main_path)
+            sub_tpl = self.load_template_gray(sub_path)
+
+            if main_tpl is None or sub_tpl is None:
+                return None
+
+            h_m, w_m = main_tpl.shape[:2]
+            h_s, w_s = sub_tpl.shape[:2]
+
+            if h_m > screen_gray.shape[0] or w_m > screen_gray.shape[1]:
+                return None
+
+            res_main = cv2.matchTemplate(screen_gray, main_tpl, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res_main >= threshold)
+
+            checked = set()
+
+            for pt in zip(*loc[::-1]):
+                x, y = pt
+
+                # 去重，避免相邻重复点太多
+                key = (x // 10, y // 10)
+                if key in checked:
+                    continue
+                checked.add(key)
+
+                x1 = max(0, x - 5)
+                y1 = max(0, y - 5)
+                x2 = min(screen_gray.shape[1], x + w_m + 5)
+                y2 = min(screen_gray.shape[0], y + h_m + 5)
+
+                sub_roi = screen_gray[y1:y2, x1:x2]
+
+                if sub_roi.shape[0] < h_s or sub_roi.shape[1] < w_s:
+                    continue
+
+                res_sub = cv2.matchTemplate(sub_roi, sub_tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val_sub, _, _ = cv2.minMaxLoc(res_sub)
+
+                if max_val_sub >= sub_threshold:
+                    cx = x + w_m // 2
+                    cy = y + h_m // 2
+                    if region:
+                        cx += region[0]
+                        cy += region[1]
+                    return (cx, cy)
+
+            return None
+
+        except Exception as e:
+            self.log(f"find_image_with_element_fast 异常: {e}")
+            return None
+
     def wait_for_image_with_element_multi(self, main_path, sub_path, region=None, fast_mode=True,
-                                          main_threshold=0.60, like_threshold=0.75,
-                                          final_threshold=0.72, timeout=30, interval=0.4):
+        main_threshold=0.60, like_threshold=0.75,
+        final_threshold=0.72, timeout=30, interval=0.4):
         start = time.time()
 
         while self.is_running and time.time() - start < timeout:
@@ -1683,6 +1832,59 @@ class FH_UltimateBot(ctk.CTk):
             sleep_end = time.time() + interval
             while self.is_running and time.time() < sleep_end:
                 time.sleep(0.05)
+
+        return None
+    def wait_for_image_with_element_stable(
+        self,
+        main_path,
+        sub_path,
+        region=None,
+        main_threshold=0.60,
+        verify_threshold=0.72,
+        sub_threshold=0.70,
+        max_candidates=15,
+        timeout=3,
+        interval=0.2
+    ):
+        start = time.time()
+        while self.is_running and time.time() - start < timeout:
+            pos = self.find_image_with_element_stable(
+                main_path=main_path,
+                sub_path=sub_path,
+                region=region,
+                main_threshold=main_threshold,
+                verify_threshold=verify_threshold,
+                sub_threshold=sub_threshold,
+                max_candidates=max_candidates
+            )
+            if pos:
+                return pos
+            time.sleep(interval)
+        return None
+    def wait_for_image_with_element_fast(
+        self,
+        main_path,
+        sub_path,
+        region=None,
+        threshold=0.70,
+        sub_threshold=0.70,
+        timeout=4,
+        interval=0.25
+    ):
+        start = time.time()
+
+        while self.is_running and time.time() - start < timeout:
+            pos = self.find_image_with_element_fast(
+                main_path=main_path,
+                sub_path=sub_path,
+                region=region,
+                threshold=threshold,
+                sub_threshold=sub_threshold
+            )
+            if pos:
+                return pos
+
+            time.sleep(interval)
 
         return None
 
@@ -2345,7 +2547,7 @@ class FH_UltimateBot(ctk.CTk):
             ["buyandsell-w.png", "buyandsell-b.png"],
             region=self.regions["左"],
             threshold=0.75,
-            timeout=40,
+            timeout=60,
             interval=0.5,
             fast_mode=True
         )
@@ -2356,49 +2558,15 @@ class FH_UltimateBot(ctk.CTk):
         self.game_click(pos_bs)
         time.sleep(1.0)
         self.hw_press("pagedown", delay=0.15)
+        self.log("进入车辆界面...")
         time.sleep(0.5)
 
         while self.cj_counter < target_count:
             if not self.is_running:
                 return False
-
-            for _ in range(2):
-                self.hw_press("down", delay=0.15)
-                time.sleep(0.4)
-
+            self.log("进入我的车辆.")
             self.hw_press("enter")
-            time.sleep(1.0)
-            self.hw_press("enter")
-            time.sleep(1.0)
-
-            pos = self.wait_for_image(
-                "DSI.png",
-                region=self.regions["左"],
-                threshold=0.75,
-                timeout=2.5,
-                interval=0.4,
-                fast_mode=True
-            )
-            if pos:
-                self.log("识别到 不要显示该消息，点击...")
-                self.game_click(pos)
-                time.sleep(0.8)
-
-            pos = self.wait_for_image(
-                "choosecar.png",
-                region=self.regions["左"],
-                threshold=0.75,
-                timeout=8,
-                interval=0.3,
-                fast_mode=True
-            )
-            if not pos:
-                self.log("未识别到 选择车辆")
-                return False
-
-            self.game_click(pos)
-            time.sleep(0.8)
-
+            time.sleep(2.0)
             self.hw_press("backspace")
             time.sleep(1.0)
 
@@ -2432,49 +2600,30 @@ class FH_UltimateBot(ctk.CTk):
             for _ in range(85):
                 if not self.is_running:
                     return False
-
-                pos_target = self.wait_for_image_with_element_multi(
+                pos_target = self.find_image_with_element(
                     "newCC.png",
                     "newcartag.png",
                     region=self.regions["全界面"],
-                    fast_mode=False,
-                    main_threshold=0.60,
-                    like_threshold=0.70,
-                    final_threshold=0.70,
-                    timeout=10,
-                    interval=0.25
+                    threshold=0.85,
+                    fast_mode=True
                 )
                 if pos_target:
                     self.game_click(pos_target)
                     found_car = True
                     break
-
                 for _ in range(4):
                     self.hw_press("right", delay=0.05)
                     time.sleep(0.08)
                 time.sleep(0.4)
-
             if not found_car:
                 self.log("列表中未找到目标车辆")
                 return False
-            time.sleep(0.5)
+            time.sleep(1.2)
+            self.hw_press("enter")
+            time.sleep(1.0)
             self.hw_press("enter")
             time.sleep(1.0)
 
-            pos = self.wait_for_any_image(
-                ["choosecar.png", "choosecar-b.png"],
-                region=self.regions["左下"],
-                threshold=0.75,
-                timeout=15,
-                interval=0.5,
-                fast_mode=True
-            )
-            if pos:
-                self.hw_press("esc")
-                time.sleep(0.8)
-            else:
-                self.log("未退出到设计与喷涂")
-                return False
 
             pos_sjy = None
             for _ in range(60):
@@ -2563,7 +2712,10 @@ class FH_UltimateBot(ctk.CTk):
             time.sleep(0.8)
             self.hw_press("up", delay=0.15)
             time.sleep(0.8)
-
+        self.hw_press("esc")
+        time.sleep(1.2)
+        self.hw_press("esc")
+        time.sleep(1.2)
         return True
     # ==========================================
     # --- 模块：移除车辆 ---
@@ -2698,7 +2850,7 @@ class FH_UltimateBot(ctk.CTk):
         time.sleep(1.5)
 
         self.log("开始删除最近获得的车辆...")
-        
+
         while self.sc_count < target_count:
             self.log(f"is_running = {self.is_running}")
             if not self.is_running:
