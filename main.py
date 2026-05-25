@@ -7,6 +7,7 @@ import ctypes
 import threading
 import subprocess
 import webbrowser
+import traceback
 
 # 【极其关键】：必须在任何 UI 库导入之前设置 DPI 感知
 try:
@@ -56,7 +57,24 @@ LOG_FILE = os.path.join(APP_DIR, "bot_log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
+DIAGNOSTICS_DIR = os.path.join(APP_DIR, "diagnostics")
 CURRENT_VERSION = "1.1.2"
+POST_RACE_RATING_ACTION_LABEL_TO_KEY = {
+    "自动取消": "cancel",
+    "自动点赞": "like",
+}
+POST_RACE_RATING_ACTION_KEY_TO_LABEL = {
+    value: label for label, value in POST_RACE_RATING_ACTION_LABEL_TO_KEY.items()
+}
+POST_RACE_RATING_ACTION_TEMPLATES = {
+    "cancel": ["CancelW.png", "CancelW2.png", "CancelB.png", "CancelB2.png"],
+    "like": ["LikeW.png", "LikeW2.png", "LikeB.png", "LikeB2.png"],
+}
+POST_RACE_RATING_SIGNAL_TEMPLATES = (
+    POST_RACE_RATING_ACTION_TEMPLATES["cancel"]
+    + POST_RACE_RATING_ACTION_TEMPLATES["like"]
+    + ["DislikeW.png", "DislikeW2.png"]
+)
 
 def auto_extract_images(folder_name="images"):
     internal_dir = os.path.join(INTERNAL_DIR, folder_name)
@@ -303,6 +321,15 @@ class FH_UltimateBot(ctk.CTk):
         self.support_win = None
         self.edge_template_cache = {}
         self.scaled_edge_template_cache = {}
+        self.current_step_name = ""
+        self.last_failure_context = None
+        self.failure_snapshot_lock = threading.Lock()
+        self.failure_snapshot_counter = 0
+        self.failure_snapshot_cooldown = {}
+        self.process_guard_thread = None
+        self.process_guard_stop_event = None
+        self.process_lost_event = threading.Event()
+        self.recovery_in_progress = threading.Event()
 
         self.init_regions()
         self.prepare_template_cache()
@@ -326,6 +353,15 @@ class FH_UltimateBot(ctk.CTk):
             "share_code": "890169683",
             "auto_restart": False,
             "restart_cmd": "start steam://run/2483190",
+            "race_stall_timeout_seconds": 120,
+            "race_reverse_seconds": 3,
+            "process_guard_interval_seconds": 120,
+            "post_race_rating_enabled": True,
+            "post_race_rating_timeout_seconds": 60,
+            "post_race_rating_action": "cancel",
+            "super_calc_target": "",
+            "super_calc_race_sp": "10",
+            "super_calc_spin_sp": "30",
         }
         self.load_config()
 
@@ -381,6 +417,38 @@ class FH_UltimateBot(ctk.CTk):
         except Exception:
             entry_widget.delete(0, "end")
             entry_widget.insert(0, str(default_value))
+
+    def normalize_positive_entry(self, entry_widget, default_value, min_value=1):
+        try:
+            v = "".join(c for c in entry_widget.get() if c.isdigit())
+            if v == "":
+                v = str(default_value)
+            iv = int(v)
+            if iv < min_value:
+                iv = min_value
+            entry_widget.delete(0, "end")
+            entry_widget.insert(0, str(iv))
+        except Exception:
+            entry_widget.delete(0, "end")
+            entry_widget.insert(0, str(default_value))
+
+    def get_positive_entry_value(self, entry_widget, default_value, min_value=1):
+        try:
+            v = "".join(c for c in entry_widget.get() if c.isdigit())
+            value = int(v) if v else int(default_value)
+        except Exception:
+            value = int(default_value)
+
+        if value < min_value:
+            value = min_value
+
+        try:
+            entry_widget.delete(0, "end")
+            entry_widget.insert(0, str(value))
+        except Exception:
+            pass
+
+        return value
     # ==========================================
     # --- 初始化全局 Region ---
     # ==========================================
@@ -430,17 +498,48 @@ class FH_UltimateBot(ctk.CTk):
         except Exception:
             pass
 
+        self.config["race_stall_timeout_seconds"] = self.get_positive_entry_value(
+            self.entry_race_stall_timeout,
+            self.config.get("race_stall_timeout_seconds", 120),
+        )
+        self.config["race_reverse_seconds"] = self.get_positive_entry_value(
+            self.entry_race_reverse_seconds,
+            self.config.get("race_reverse_seconds", 3),
+        )
+        self.config["process_guard_interval_seconds"] = self.get_positive_entry_value(
+            self.entry_process_guard_interval,
+            self.config.get("process_guard_interval_seconds", 120),
+        )
+        if hasattr(self, "entry_post_race_rating_timeout"):
+            self.config["post_race_rating_timeout_seconds"] = self.get_positive_entry_value(
+                self.entry_post_race_rating_timeout,
+                self.config.get("post_race_rating_timeout_seconds", 60),
+            )
+
         self.config["chk_1"] = self.var_chk1.get()
         self.config["chk_2"] = self.var_chk2.get()
         self.config["chk_3"] = self.var_chk3.get()
         self.config["chk_4"] = self.var_chk4.get()
         self.config["auto_restart"] = self.var_auto_restart.get()
         self.config["restart_cmd"] = self.le_restart_cmd.get().strip()
+        self.config.pop("race_car_template", None)
+        self.config.pop("race_car_fallback_enabled", None)
         try:
+            if hasattr(self, "var_post_race_rating_enabled"):
+                self.config["post_race_rating_enabled"] = bool(self.var_post_race_rating_enabled.get())
+            if hasattr(self, "option_post_race_rating_action"):
+                self.config["post_race_rating_action"] = POST_RACE_RATING_ACTION_LABEL_TO_KEY.get(
+                    self.option_post_race_rating_action.get(),
+                    self.config.get("post_race_rating_action", "cancel"),
+                )
             if hasattr(self, "entry_calc_a"):
                 self.config["calc_a"] = self.entry_calc_a.get().strip()
                 self.config["calc_b"] = self.entry_calc_b.get().strip()
                 self.config["calc_c"] = self.entry_calc_c.get().strip()
+            if hasattr(self, "entry_super_calc_target"):
+                self.config["super_calc_target"] = self.entry_super_calc_target.get().strip()
+                self.config["super_calc_race_sp"] = self.entry_super_calc_race_sp.get().strip()
+                self.config["super_calc_spin_sp"] = self.entry_super_calc_spin_sp.get().strip()
         except Exception:
             pass
         try:
@@ -448,6 +547,207 @@ class FH_UltimateBot(ctk.CTk):
                 json.dump(self.config, f, indent=4, ensure_ascii=False)
         except Exception:
             pass
+
+    def apply_pipeline_values(self, races_per_loop, actions_per_loop, loops):
+        self.entry_race.delete(0, "end")
+        self.entry_race.insert(0, str(races_per_loop))
+
+        self.entry_car.delete(0, "end")
+        self.entry_car.insert(0, str(actions_per_loop))
+
+        self.entry_cj.delete(0, "end")
+        self.entry_cj.insert(0, str(actions_per_loop))
+
+        self.entry_sc.delete(0, "end")
+        self.entry_sc.insert(0, str(actions_per_loop))
+
+        self.entry_global_loop.delete(0, "end")
+        self.entry_global_loop.insert(0, str(loops))
+
+    def calculate_required_races(self, action_count, skill_points_per_action, skill_points_per_race):
+        return (action_count * skill_points_per_action + skill_points_per_race - 1) // skill_points_per_race
+
+    def get_race_car_template_candidates(self):
+        return ["skillcar.png"]
+
+    def get_post_race_rating_action(self):
+        action_key = self.config.get("post_race_rating_action", "cancel")
+        option_widget = getattr(self, "option_post_race_rating_action", None)
+        if option_widget is not None:
+            action_key = POST_RACE_RATING_ACTION_LABEL_TO_KEY.get(option_widget.get(), action_key)
+
+        if action_key not in POST_RACE_RATING_ACTION_KEY_TO_LABEL:
+            action_key = "cancel"
+
+        return action_key
+
+    def is_post_race_rating_enabled(self):
+        enabled_var = getattr(self, "var_post_race_rating_enabled", None)
+        if enabled_var is not None:
+            try:
+                return bool(enabled_var.get())
+            except Exception:
+                pass
+
+        return bool(self.config.get("post_race_rating_enabled", True))
+
+    def get_post_race_rating_timeout_seconds(self):
+        timeout_default = self.config.get("post_race_rating_timeout_seconds", 60)
+        entry_widget = getattr(self, "entry_post_race_rating_timeout", None)
+        if entry_widget is not None:
+            return self.get_positive_entry_value(entry_widget, timeout_default)
+
+        try:
+            return max(1, int(timeout_default))
+        except Exception:
+            return 60
+
+    def handle_post_race_rating_popup(self):
+        action_key = self.get_post_race_rating_action()
+        action_label = POST_RACE_RATING_ACTION_KEY_TO_LABEL.get(action_key, "自动取消")
+        action_templates = POST_RACE_RATING_ACTION_TEMPLATES.get(
+            action_key,
+            POST_RACE_RATING_ACTION_TEMPLATES["cancel"],
+        )
+        template_name, pos = self.find_any_image_with_name(
+            action_templates,
+            region=self.regions["中间"],
+            threshold=0.72,
+            fast_mode=True,
+        )
+        if not pos:
+            return False
+
+        self.log(f"[评分弹窗] 命中 {template_name}，执行{action_label}。")
+        self.game_click(pos)
+        time.sleep(0.6)
+        self.hw_press("enter")
+        time.sleep(0.8)
+
+        remain_name, remain_pos = self.find_any_image_with_name(
+            POST_RACE_RATING_SIGNAL_TEMPLATES,
+            region=self.regions["中间"],
+            threshold=0.72,
+            fast_mode=True,
+        )
+        if remain_pos:
+            self.log(f"[评分弹窗] 动作后仍检测到 {remain_name}，追加 Enter 兜底。")
+            self.hw_press("enter")
+            time.sleep(0.8)
+
+        return True
+
+    def wait_for_post_race_rating_watchdog(self, timeout_seconds):
+        timeout_seconds = max(1, int(timeout_seconds))
+        action_label = POST_RACE_RATING_ACTION_KEY_TO_LABEL.get(
+            self.get_post_race_rating_action(),
+            "自动取消",
+        )
+        self.log(f"[评分弹窗] 退出赛事后启动 {timeout_seconds} 秒看门狗，动作: {action_label}。")
+
+        deadline = time.time() + timeout_seconds
+        while self.is_running and time.time() < deadline:
+            if self.should_abort_for_process_loss(
+                {
+                    "phase": "post_race_rating_watchdog",
+                    "race_index": self.race_counter + 1,
+                    "timeout_seconds": timeout_seconds,
+                }
+            ):
+                return False
+
+            popup_name, popup_pos = self.find_any_image_with_name(
+                POST_RACE_RATING_SIGNAL_TEMPLATES,
+                region=self.regions["中间"],
+                threshold=0.72,
+                fast_mode=True,
+            )
+            if popup_pos:
+                self.log(f"[评分弹窗] 检测到评分弹窗信号 {popup_name}，准备执行{action_label}。")
+                if self.handle_post_race_rating_popup():
+                    return True
+                self.log("[评分弹窗] 已识别到弹窗，但未命中目标按钮模板，继续等待。")
+
+            if self.is_in_menu():
+                self.log("[评分弹窗] 已检测到菜单锚点，流程继续。")
+                return True
+
+            anchor_name, _ = self.find_world_anchor(threshold=0.55)
+            if anchor_name:
+                self.log(f"[评分弹窗] 已检测到大世界锚点 {anchor_name}，流程继续。")
+                return True
+
+            progress_name, progress_pos = self.find_any_image_with_name(
+                ["start.png", "startw.png"],
+                region=self.regions["左下"],
+                threshold=0.75,
+                fast_mode=True,
+            )
+            if progress_pos:
+                self.log(f"[评分弹窗] 已检测到后续流程锚点 {progress_name}，流程继续。")
+                return True
+
+            time.sleep(0.5)
+
+        popup_name, popup_pos = self.find_any_image_with_name(
+            POST_RACE_RATING_SIGNAL_TEMPLATES,
+            region=self.regions["中间"],
+            threshold=0.72,
+            fast_mode=True,
+        )
+        if popup_pos:
+            self.log(f"[评分弹窗] 超时边界检测到 {popup_name}，追加执行{action_label}。")
+            if self.handle_post_race_rating_popup():
+                return True
+            self.log("[评分弹窗] 超时边界已识别到弹窗，但未命中目标按钮模板，继续按当前流程执行。")
+
+        self.log(f"[评分弹窗] {timeout_seconds} 秒内未检测到评分弹窗或稳定锚点，继续按当前流程执行。")
+        return True
+
+    def wait_for_race_car_template_multi(self, template_candidates, region, timeout=10, interval=0.25):
+        if not template_candidates:
+            return None, None
+
+        per_template_timeout = max(2, (int(timeout) + len(template_candidates) - 1) // len(template_candidates))
+        for idx, template_name in enumerate(template_candidates, start=1):
+            if not self.is_running:
+                return None, None
+
+            self.log(f"尝试识别刷图车模板 {template_name} ({idx}/{len(template_candidates)})...")
+            pos = self.wait_for_image_with_element_multi(
+                template_name,
+                "liketag.png",
+                region=region,
+                fast_mode=False,
+                main_threshold=0.60,
+                like_threshold=0.7,
+                final_threshold=0.7,
+                timeout=per_template_timeout,
+                interval=interval,
+            )
+            if pos:
+                self.log(f"命中刷图车模板: {template_name}")
+                return pos, template_name
+
+        return None, None
+
+    def find_race_car_template_in_list(self, template_candidates, region, threshold=0.8, fast_mode=True):
+        for template_name in template_candidates:
+            if not self.is_running:
+                return None, None
+
+            pos = self.find_image_with_element(
+                template_name,
+                "liketag.png",
+                region=region,
+                threshold=threshold,
+                fast_mode=fast_mode,
+            )
+            if pos:
+                self.log(f"命中刷图车模板: {template_name}")
+                return pos, template_name
+
+        return None, None
 
     def auto_calculate_pipeline(self):
         val_a = self.entry_calc_a.get().strip()
@@ -504,22 +804,78 @@ class FH_UltimateBot(ctk.CTk):
             return
 
         # 4. 自动填写到界面
-        self.entry_race.delete(0, "end")
-        self.entry_race.insert(0, str(final_races_per_loop))
-        
-        self.entry_car.delete(0, "end")
-        self.entry_car.insert(0, str(cars_per_loop))
-        
-        self.entry_cj.delete(0, "end")
-        self.entry_cj.insert(0, str(cars_per_loop))
-        
-        self.entry_sc.delete(0, "end")
-        self.entry_sc.insert(0, str(cars_per_loop))
-        
-        self.entry_global_loop.delete(0, "end")
-        self.entry_global_loop.insert(0, str(final_loops))
+        self.apply_pipeline_values(final_races_per_loop, cars_per_loop, final_loops)
 
         self.log(f"✅计算完成: 总计需{total_cars}车, 共跑图{total_races}次。分配为: {final_loops} 个大循环, 每轮跑图 {final_races_per_loop} 次, 动作 {cars_per_loop} 辆。")
+        self.save_config()
+
+    def auto_calculate_super_wheelspin(self):
+        val_target = self.entry_super_calc_target.get().strip()
+        if not val_target:
+            self.log("未输入目标超级抽奖数，无需计算。")
+            return
+
+        try:
+            target_spins = int(val_target)
+            val_race_sp = self.entry_super_calc_race_sp.get().strip()
+            skill_points_per_race = int(val_race_sp) if val_race_sp else 10
+
+            val_spin_sp = self.entry_super_calc_spin_sp.get().strip()
+            skill_points_per_spin = int(val_spin_sp) if val_spin_sp else 30
+        except Exception:
+            self.log("超级抽奖计算器输入格式有误，请确保只输入数字！")
+            return
+
+        if target_spins <= 0:
+            self.log("目标超级抽奖数必须大于 0！")
+            return
+
+        if skill_points_per_race <= 0 or skill_points_per_spin <= 0:
+            self.log("每圈技术点和每抽需技术点都必须大于 0！")
+            return
+
+        total_races = self.calculate_required_races(
+            target_spins,
+            skill_points_per_spin,
+            skill_points_per_race,
+        )
+
+        loops = max(1, (total_races + 98) // 99)
+        spins_per_loop = (target_spins + loops - 1) // loops
+        races_per_loop = self.calculate_required_races(
+            spins_per_loop,
+            skill_points_per_spin,
+            skill_points_per_race,
+        )
+
+        while races_per_loop > 99:
+            loops += 1
+            spins_per_loop = (target_spins + loops - 1) // loops
+            races_per_loop = self.calculate_required_races(
+                spins_per_loop,
+                skill_points_per_spin,
+                skill_points_per_race,
+            )
+
+        actual_total_spins = loops * spins_per_loop
+        actual_total_races = loops * races_per_loop
+
+        self.apply_pipeline_values(races_per_loop, spins_per_loop, loops)
+
+        extra_spins = actual_total_spins - target_spins
+        if extra_spins > 0:
+            self.log(
+                f"✅超级抽奖计算完成: 目标 {target_spins} 次，至少需跑图 {total_races} 次。"
+                f"当前分配为 {loops} 个大循环，每轮跑图 {races_per_loop} 次，买车/抽奖/移除各 {spins_per_loop} 辆。"
+                f"由于按整轮保守向上取整，实际可覆盖约 {actual_total_spins} 次超级抽奖（多出 {extra_spins} 次），总跑图约 {actual_total_races} 次。"
+            )
+        else:
+            self.log(
+                f"✅超级抽奖计算完成: 目标 {target_spins} 次，至少需跑图 {total_races} 次。"
+                f"当前分配为 {loops} 个大循环，每轮跑图 {races_per_loop} 次，买车/抽奖/移除各 {spins_per_loop} 辆，"
+                f"总跑图约 {actual_total_races} 次。"
+            )
+
         self.save_config()
 
     # ==========================================
@@ -735,8 +1091,12 @@ class FH_UltimateBot(ctk.CTk):
         )
 
         self.next_frame4, self.entry_next4, self.chk4 = create_next_step(
-            self.config_frame, self.var_chk4, self.config.get("next_4", 1)
+            self.config_frame,
+            self.var_chk4,
+            self.config.get("next_4", 1),
+            box_h=470,
         )
+        self.next_frame4.configure(width=240, border_width=2, border_color="#F1C40F")
                 # ====== 抽离到底部的全局设置栏 (放在上方) ======
         # 【修改1】把 self.top_container 改成了 self
         self.global_settings_frame = ctk.CTkFrame(self, fg_color="#2B2B2B", height=45, corner_radius=10)
@@ -760,6 +1120,18 @@ class FH_UltimateBot(ctk.CTk):
         self.le_restart_cmd = ctk.CTkEntry(self.global_settings_frame, width=250, height=28)
         self.le_restart_cmd.insert(0, self.config.get("restart_cmd", "start steam://run/2483190"))
         self.le_restart_cmd.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(self.next_frame4, text="跑图兜底", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(14, 4))
+
+        ctk.CTkLabel(self.next_frame4, text="超时秒数", font=ctk.CTkFont(size=14)).pack(pady=(6, 2))
+        self.entry_race_stall_timeout = ctk.CTkEntry(self.next_frame4, width=90, justify="center")
+        self.entry_race_stall_timeout.insert(0, str(self.config.get("race_stall_timeout_seconds", 120)))
+        self.entry_race_stall_timeout.pack(pady=2)
+
+        ctk.CTkLabel(self.next_frame4, text="倒车秒数", font=ctk.CTkFont(size=14)).pack(pady=(6, 2))
+        self.entry_race_reverse_seconds = ctk.CTkEntry(self.next_frame4, width=90, justify="center")
+        self.entry_race_reverse_seconds.insert(0, str(self.config.get("race_reverse_seconds", 3)))
+        self.entry_race_reverse_seconds.pack(pady=2)
 
 
         # ====== 新增：智能计算分配工具栏 (放在下方) ======
@@ -807,16 +1179,112 @@ class FH_UltimateBot(ctk.CTk):
         self.entry_calc_a.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_calc_a, 10))
         self.entry_calc_b.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_calc_b, 7))
         self.entry_calc_c.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_calc_c, 2))
+
+        self.super_calc_frame = ctk.CTkFrame(self, fg_color="#2B2B2B", height=45, corner_radius=10)
+        self.super_calc_frame.pack(fill="x", padx=18, pady=(10, 0))
+        self.super_calc_frame.pack_propagate(False)
+        ctk.CTkLabel(
+            self.super_calc_frame,
+            text="超级抽奖计算器",
+            font=ctk.CTkFont(weight="bold", size=15),
+            text_color="#58A6FF"
+        ).pack(side="left", padx=(15, 20))
+        ctk.CTkLabel(self.super_calc_frame, text="目标抽奖数:").pack(side="left", padx=(0, 5))
+        self.entry_super_calc_target = ctk.CTkEntry(self.super_calc_frame, width=110, height=28, placeholder_text="留空不计算")
+        self.entry_super_calc_target.insert(0, self.config.get("super_calc_target", ""))
+        self.entry_super_calc_target.pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(self.super_calc_frame, text="每圈技术点:").pack(side="left", padx=(0, 5))
+        self.entry_super_calc_race_sp = ctk.CTkEntry(self.super_calc_frame, width=60, height=28)
+        self.entry_super_calc_race_sp.insert(0, self.config.get("super_calc_race_sp", "10"))
+        self.entry_super_calc_race_sp.pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(self.super_calc_frame, text="每抽需技术点:").pack(side="left", padx=(0, 5))
+        self.entry_super_calc_spin_sp = ctk.CTkEntry(self.super_calc_frame, width=60, height=28)
+        self.entry_super_calc_spin_sp.insert(0, self.config.get("super_calc_spin_sp", "30"))
+        self.entry_super_calc_spin_sp.pack(side="left", padx=(0, 15))
+        ctk.CTkButton(
+            self.super_calc_frame,
+            text="计算并应用",
+            width=90,
+            height=28,
+            fg_color="#1F6AA5",
+            hover_color="#185680",
+            command=self.auto_calculate_super_wheelspin
+        ).pack(side="left", padx=(0, 15))
+
+        self.entry_super_calc_target.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_super_calc_target, 10))
+        self.entry_super_calc_race_sp.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_super_calc_race_sp, 2))
+        self.entry_super_calc_spin_sp.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_super_calc_spin_sp, 2))
         # ==========================================
         #ctk.CTkLabel(self.global_settings_frame, text="图片原宽（不要修改）:").pack(side="left", padx=(10, 5))
         #self.entry_base_w = ctk.CTkEntry(self.global_settings_frame, width=70, height=28, justify="center")
         #self.entry_base_w.insert(0, str(self.config.get("base_width", 2560)))
         #self.entry_base_w.pack(side="left", padx=(0, 20))
 
+        ctk.CTkLabel(self.next_frame4, text="进程检测秒数", font=ctk.CTkFont(size=14)).pack(pady=(10, 2))
+        self.entry_process_guard_interval = ctk.CTkEntry(self.next_frame4, width=90, justify="center")
+        self.entry_process_guard_interval.insert(0, str(self.config.get("process_guard_interval_seconds", 120)))
+        self.entry_process_guard_interval.pack(pady=(0, 4))
+
+        self.var_post_race_rating_enabled = ctk.BooleanVar(value=self.config.get("post_race_rating_enabled", True))
+        self.chk_post_race_rating_enabled = ctk.CTkCheckBox(
+            self.next_frame4,
+            text="后赛评分弹窗兜底",
+            variable=self.var_post_race_rating_enabled,
+        )
+        self.chk_post_race_rating_enabled.pack(pady=(12, 4))
+
+        ctk.CTkLabel(self.next_frame4, text="评分等待秒数", font=ctk.CTkFont(size=14)).pack(pady=(2, 2))
+        self.entry_post_race_rating_timeout = ctk.CTkEntry(self.next_frame4, width=90, justify="center")
+        self.entry_post_race_rating_timeout.insert(0, str(self.config.get("post_race_rating_timeout_seconds", 60)))
+        self.entry_post_race_rating_timeout.pack(pady=(0, 4))
+
+        ctk.CTkLabel(self.next_frame4, text="评分处理动作", font=ctk.CTkFont(size=14)).pack(pady=(2, 2))
+        self.option_post_race_rating_action = ctk.CTkOptionMenu(
+            self.next_frame4,
+            width=130,
+            values=list(POST_RACE_RATING_ACTION_LABEL_TO_KEY.keys()),
+            dynamic_resizing=False,
+        )
+        self.option_post_race_rating_action.set(
+            POST_RACE_RATING_ACTION_KEY_TO_LABEL.get(
+                self.config.get("post_race_rating_action", "cancel"),
+                "自动取消",
+            )
+        )
+        self.option_post_race_rating_action.pack(pady=(0, 6))
+
         self.entry_next1.bind("<FocusOut>", lambda e: self.normalize_step_entry(self.entry_next1, 2))
         self.entry_next2.bind("<FocusOut>", lambda e: self.normalize_step_entry(self.entry_next2, 3))
         self.entry_next3.bind("<FocusOut>", lambda e: self.normalize_step_entry(self.entry_next3, 4))
         self.entry_next4.bind("<FocusOut>", lambda e: self.normalize_step_entry(self.entry_next4, 1))
+        self.entry_race_stall_timeout.bind(
+            "<FocusOut>",
+            lambda e: self.normalize_positive_entry(
+                self.entry_race_stall_timeout,
+                self.config.get("race_stall_timeout_seconds", 120),
+            ),
+        )
+        self.entry_race_reverse_seconds.bind(
+            "<FocusOut>",
+            lambda e: self.normalize_positive_entry(
+                self.entry_race_reverse_seconds,
+                self.config.get("race_reverse_seconds", 3),
+            ),
+        )
+        self.entry_process_guard_interval.bind(
+            "<FocusOut>",
+            lambda e: self.normalize_positive_entry(
+                self.entry_process_guard_interval,
+                self.config.get("process_guard_interval_seconds", 120),
+            ),
+        )
+        self.entry_post_race_rating_timeout.bind(
+            "<FocusOut>",
+            lambda e: self.normalize_positive_entry(
+                self.entry_post_race_rating_timeout,
+                self.config.get("post_race_rating_timeout_seconds", 60),
+            ),
+        )
 
         if not self.entry_sc.get().strip():
             self.entry_sc.insert(0, "30")
@@ -1193,6 +1661,256 @@ class FH_UltimateBot(ctk.CTk):
                 pass
         self.ui_call(write_ui)
 
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(full_msg + "\n")
+        except Exception:
+            pass
+
+    def set_failure_context(self, reason, details=None):
+        self.last_failure_context = {
+            "reason": reason,
+            "details": details or {},
+        }
+
+    def clear_failure_context(self):
+        self.last_failure_context = None
+
+    def sanitize_diagnostic_token(self, value):
+        text = str(value or "unknown").strip().lower()
+        token = []
+        for ch in text:
+            if ch.isalnum() or ch in ("-", "_"):
+                token.append(ch)
+            else:
+                token.append("_")
+
+        safe_value = "".join(token).strip("_")
+        return safe_value or "unknown"
+
+    def get_failure_snapshot_region(self):
+        region = self.regions.get("全界面")
+        if not region or len(region) != 4:
+            return None
+
+        x, y, w, h = region
+        if w <= 0 or h <= 0:
+            return None
+
+        return (int(x), int(y), int(w), int(h))
+
+    def capture_failure_snapshot(self, reason, module_name=None, details=None):
+        try:
+            module_name = module_name or self.current_step_name or "unknown"
+            details = details or {}
+            cooldown_key = f"{module_name}:{reason}"
+            now = time.time()
+            last_capture = self.failure_snapshot_cooldown.get(cooldown_key, 0)
+            if now - last_capture < 10.0:
+                self.log(f"[诊断] {module_name}/{reason} 在冷却期内，跳过重复截图。")
+                return None
+
+            self.failure_snapshot_cooldown[cooldown_key] = now
+
+            with self.failure_snapshot_lock:
+                self.failure_snapshot_counter += 1
+                snapshot_index = self.failure_snapshot_counter
+
+            local_time = time.localtime(now)
+            event_id = f"{time.strftime('%Y%m%d_%H%M%S', local_time)}_{int((now % 1) * 1000):03d}_{snapshot_index:04d}"
+            date_dir = os.path.join(DIAGNOSTICS_DIR, time.strftime("%Y-%m-%d", local_time))
+            os.makedirs(date_dir, exist_ok=True)
+
+            module_token = self.sanitize_diagnostic_token(module_name)
+            reason_token = self.sanitize_diagnostic_token(reason)
+            base_name = f"{event_id}_{module_token}_{reason_token}"
+            screenshot_path = os.path.join(date_dir, base_name + ".png")
+            meta_path = os.path.join(date_dir, base_name + ".json")
+
+            screenshot_saved = False
+            screenshot_error = None
+            region = self.get_failure_snapshot_region()
+            capture_regions = [region]
+            if region is not None:
+                capture_regions.append(None)
+
+            for capture_region in capture_regions:
+                try:
+                    screen_bgr = self.capture_region(capture_region)
+                    if cv2.imwrite(screenshot_path, screen_bgr):
+                        screenshot_saved = True
+                        break
+                except Exception as e:
+                    screenshot_error = str(e)
+
+            metadata = {
+                "event_id": event_id,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", local_time),
+                "module": module_name,
+                "reason": reason,
+                "details": details,
+                "current_step": self.current_step_name,
+                "is_running": self.is_running,
+                "counters": {
+                    "race_counter": self.race_counter,
+                    "car_counter": self.car_counter,
+                    "cj_counter": self.cj_counter,
+                    "sc_count": self.sc_count,
+                    "global_loop_current": self.global_loop_current,
+                },
+                "window_region": list(region) if region else None,
+                "config_snapshot": {
+                    "race_stall_timeout_seconds": self.config.get("race_stall_timeout_seconds", 120),
+                    "race_reverse_seconds": self.config.get("race_reverse_seconds", 3),
+                    "process_guard_interval_seconds": self.config.get("process_guard_interval_seconds", 120),
+                    "auto_restart": self.config.get("auto_restart", False),
+                },
+                "log_path": LOG_FILE,
+                "screenshot_path": screenshot_path if screenshot_saved else None,
+                "screenshot_error": screenshot_error,
+            }
+
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=4, ensure_ascii=False, default=str)
+
+            if screenshot_saved:
+                self.log(f"[诊断] 已保存失败截图: {screenshot_path}")
+            else:
+                self.log(f"[诊断] 截图保存失败，已记录诊断信息: {meta_path}")
+
+            self.log(f"[诊断] 事件 {event_id}，诊断文件: {meta_path}")
+            return {
+                "event_id": event_id,
+                "screenshot_path": screenshot_path if screenshot_saved else None,
+                "meta_path": meta_path,
+            }
+        except Exception as e:
+            self.log(f"[诊断] 保存失败现场时异常: {e}")
+            return None
+
+    def perform_race_stall_recovery(self, reverse_seconds):
+        self.hw_key_up("w")
+        if not self.is_running:
+            return False
+
+        self.hw_key_down("s")
+        reverse_end = time.time() + reverse_seconds
+        while self.is_running and time.time() < reverse_end:
+            time.sleep(0.05)
+        self.hw_key_up("s")
+
+        if not self.is_running:
+            return False
+
+        recovery_end = time.time() + 0.2
+        while self.is_running and time.time() < recovery_end:
+            time.sleep(0.05)
+
+        if not self.is_running:
+            return False
+
+        self.hw_key_down("w")
+        return True
+
+    def is_auto_restart_enabled(self):
+        auto_restart = getattr(self, "var_auto_restart", None)
+        if auto_restart is None:
+            return bool(self.config.get("auto_restart", False))
+
+        try:
+            return bool(auto_restart.get())
+        except Exception:
+            return bool(self.config.get("auto_restart", False))
+
+    def get_game_process_pid(self, log_details=False):
+        try:
+            CREATE_NO_WINDOW = 0x08000000
+            cmd = 'tasklist /FI "IMAGENAME eq forzahorizon6.exe" /NH /FO CSV'
+            output = subprocess.check_output(cmd, shell=True, text=True, creationflags=CREATE_NO_WINDOW)
+
+            if "forzahorizon6.exe" not in output.lower():
+                if log_details:
+                    self.log("未发现 forzahorizon6.exe 进程！(请确保游戏已运行)")
+                return None
+
+            for line in output.strip().split("\n"):
+                parts = line.split('\",\"')
+                if len(parts) >= 2 and "forzahorizon6.exe" in parts[0].lower():
+                    return int(parts[1].replace('"', ""))
+
+            if log_details:
+                self.log("找到进程但无法解析PID！")
+            return None
+        except Exception as e:
+            if log_details:
+                self.log(f"检查进程异常: {e}")
+            return None
+
+    def should_abort_for_process_loss(self, details=None):
+        if not self.process_lost_event.is_set() or self.recovery_in_progress.is_set():
+            return False
+
+        if self.last_failure_context and self.last_failure_context.get("reason") == "process_guard_detected":
+            return True
+
+        detail_map = {
+            "message": "进程守护检测到 forzahorizon6.exe 已退出",
+            "guard_interval_seconds": max(1, int(self.config.get("process_guard_interval_seconds", 120))),
+            "current_step": self.current_step_name,
+        }
+        if details:
+            detail_map.update(details)
+
+        self.set_failure_context("process_guard_detected", detail_map)
+        return True
+
+    def stop_process_guard_thread(self):
+        stop_event = self.process_guard_stop_event
+        if stop_event is not None:
+            stop_event.set()
+
+        guard_thread = self.process_guard_thread
+        if guard_thread and guard_thread.is_alive() and guard_thread is not threading.current_thread():
+            guard_thread.join(timeout=0.5)
+
+        self.process_guard_thread = None
+        self.process_guard_stop_event = None
+
+    def process_guard_loop(self, stop_event):
+        while self.is_running and not stop_event.is_set():
+            interval = max(1, int(self.config.get("process_guard_interval_seconds", 120)))
+            if stop_event.wait(timeout=interval):
+                return
+
+            if not self.is_running or stop_event.is_set():
+                return
+
+            if self.recovery_in_progress.is_set() or self.process_lost_event.is_set():
+                continue
+
+            if not self.is_auto_restart_enabled():
+                return
+
+            if self.get_game_process_pid(log_details=False) is None:
+                self.log(f"进程守护：检测间隔 {interval} 秒，发现 forzahorizon6.exe 已退出，准备恢复。")
+                self.process_lost_event.set()
+                return
+
+    def start_process_guard_thread(self):
+        self.stop_process_guard_thread()
+
+        if not self.is_running or self.recovery_in_progress.is_set() or not self.is_auto_restart_enabled():
+            return
+
+        interval = max(1, int(self.config.get("process_guard_interval_seconds", 120)))
+        self.process_guard_stop_event = threading.Event()
+        self.process_guard_thread = threading.Thread(
+            target=self.process_guard_loop,
+            args=(self.process_guard_stop_event,),
+            daemon=True,
+        )
+        self.process_guard_thread.start()
+        self.log(f"进程守护已启动，检测间隔: {interval} 秒。")
    
     # ==========================================
     # --- 逻辑保障 ---
@@ -1217,23 +1935,8 @@ class FH_UltimateBot(ctk.CTk):
     def check_and_focus_game(self):
         self.log("检查游戏进程 (forzahorizon6.exe)...")
         try:
-            CREATE_NO_WINDOW = 0x08000000
-            cmd = 'tasklist /FI "IMAGENAME eq forzahorizon6.exe" /NH /FO CSV'
-            output = subprocess.check_output(cmd, shell=True, text=True, creationflags=CREATE_NO_WINDOW)
-
-            if "forzahorizon6.exe" not in output.lower():
-                self.log("未发现 forzahorizon6.exe 进程！(请确保游戏已运行)")
-                return False
-
-            target_pid = None
-            for line in output.strip().split("\n"):
-                parts = line.split('","')
-                if len(parts) >= 2 and "forzahorizon6.exe" in parts[0].lower():
-                    target_pid = int(parts[1].replace('"', ""))
-                    break
-
+            target_pid = self.get_game_process_pid(log_details=True)
             if not target_pid:
-                self.log("找到进程但无法解析PID！")
                 return False
 
             hwnds = []
@@ -1293,13 +1996,68 @@ class FH_UltimateBot(ctk.CTk):
 
         return False
 
+    def log_recovery(self, message):
+        self.log(f"[恢复] {message}")
+
+    def find_world_anchor(self, threshold=0.55):
+        for image_name in ["anna.png", "link.png"]:
+            pos = self.find_image(
+                image_name,
+                region=self.regions["左下"],
+                threshold=threshold,
+                fast_mode=True,
+            )
+            if pos:
+                return image_name, pos
+
+        return None, None
+
+    def wait_for_interactive_recovery_state(self, timeout_seconds=300):
+        deadline = time.time() + timeout_seconds
+        last_enter_press_at = 0.0
+        last_continue_click_at = 0.0
+
+        while self.is_running and time.time() < deadline:
+            if self.is_in_menu():
+                self.log_recovery("检测到菜单锚点，游戏已回到菜单。")
+                return "menu"
+
+            anchor_name, _ = self.find_world_anchor(threshold=0.55)
+            if anchor_name:
+                self.log_recovery(f"检测到大世界锚点 {anchor_name}，游戏已回到可交互界面。")
+                return "world"
+
+            now = time.time()
+
+            if self.find_image("horizon6.png", threshold=0.6):
+                if now - last_enter_press_at >= 5.0:
+                    self.log_recovery("检测到欢迎界面，按 Enter 推进启动流程。")
+                    self.hw_press("enter")
+                    last_enter_press_at = now
+                time.sleep(1.5)
+                continue
+
+            pos_con = self.find_any_image(["continue-w.png", "continue-b.png"], threshold=0.6)
+            if pos_con:
+                if now - last_continue_click_at >= 8.0:
+                    self.log_recovery("检测到继续游戏，点击进入。")
+                    self.game_click(pos_con)
+                    last_continue_click_at = now
+                    time.sleep(8.0)
+                else:
+                    time.sleep(1.0)
+                continue
+
+            time.sleep(1.5)
+
+        return None
+
     def restart_game_and_boot(self):
-        auto_restart = getattr(self, "var_auto_restart", None)
-        if auto_restart is None or not auto_restart.get():
+        if not self.is_auto_restart_enabled():
             self.log("未开启自动重启，任务结束。")
             return False
 
-        self.log("触发自动重启机制！正在拉起游戏...")
+        self.log_recovery("触发自动重启机制！正在拉起游戏...")
         try:
             cmd_widget = getattr(self, "le_restart_cmd", None)
             cmd_str = cmd_widget.get() if cmd_widget else self.config.get("restart_cmd", "start steam://run/2483190")
@@ -1308,49 +2066,30 @@ class FH_UltimateBot(ctk.CTk):
             self.log(f"执行重启命令失败: {e}")
             return False
 
-        self.log("等待游戏启动加载 (10秒)...")
+        self.log_recovery("等待游戏启动加载 (10秒)...")
         for _ in range(10):
             if not self.is_running:
                 return False
             time.sleep(1)
 
-        self.log("开始持续检测开机界面元素 (限制5分钟)...")
-        for _ in range(300):
-            if not self.is_running:
-                return False
+        self.log_recovery("开始持续检测重启后的游戏状态 (限制5分钟)...")
+        recovery_state = self.wait_for_interactive_recovery_state(timeout_seconds=300)
+        if recovery_state:
+            self.log_recovery(f"自动重启后确认状态：{recovery_state}。")
+            return True
 
-            if self.find_image("horizon6.png", threshold=0.6):
-                self.log("识别到欢迎界面，按下回车。")
-                self.hw_press("enter")
-                time.sleep(4)
-                continue
-
-            pos_con = self.find_any_image(["continue-w.png", "continue-b.png"], threshold=0.6)
-            if pos_con:
-                self.log("识别到继续游戏，点击进入！")
-                self.game_click(pos_con)
-                time.sleep(10)
-                self.log("尝试按 ESC 唤出菜单...")
-                self.hw_press("esc")
-                time.sleep(2)
-                if self.enter_menu():
-                    self.log("成功重连并进入菜单，准备恢复执行！")
-                    return True
-                return False
-
-            time.sleep(2.0)
-
-        self.log("自动重启超时(2分钟未进入漫游)，放弃抢救。")
+        self.log_recovery("自动重启超时，未能确认进入大世界或菜单。")
         return False
 
     def recover_to_freeroam(self):
-        self.log("尝试退回漫游重置状态...")
+        self.log_recovery("尝试退回漫游重置状态...")
         for _ in range(30):
             if not self.is_running:
                 return False
 
-            if self.find_image("anna.png", region=self.regions["全界面"], threshold=0.5):
-                self.log("成功退回漫游界面！")
+            anchor_name, _ = self.find_world_anchor(threshold=0.55)
+            if anchor_name:
+                self.log_recovery(f"成功退回漫游界面，命中锚点 {anchor_name}。")
                 return True
 
             self.hw_press("esc")
@@ -1359,18 +2098,24 @@ class FH_UltimateBot(ctk.CTk):
         return self.wait_for_freeroam()
 
     def recover_to_menu(self):
-        self.log("尝试退回主菜单重置状态...")
+        self.log_recovery("尝试退回主菜单重置状态...")
+        world_anchor_logged = False
         for _ in range(120):
             if not self.is_running:
                 return False
 
-            if self.find_image("collectionjournal.png", region=self.regions["全界面"], threshold=0.55):
-                self.log("成功退回主菜单界面！")
+            if self.is_in_menu():
+                self.log_recovery("成功退回主菜单界面！")
                 return True
+
+            anchor_name, _ = self.find_world_anchor(threshold=0.55)
+            if anchor_name and not world_anchor_logged:
+                self.log_recovery(f"检测到大世界锚点 {anchor_name}，按 ESC 尝试进入菜单。")
+                world_anchor_logged = True
 
             pos_exit = self.find_any_image(["exit.png", "exit-b.png"], region=self.regions["左下"], threshold=0.85)
             if pos_exit:
-                self.log("识别到退出按钮，点击...")
+                self.log_recovery("识别到退出按钮，点击后继续尝试进入菜单。")
                 self.game_click(pos_exit)
                 time.sleep(1.5)
                 continue
@@ -1378,32 +2123,81 @@ class FH_UltimateBot(ctk.CTk):
             self.hw_press("esc")
             time.sleep(0.5)
 
-        self.log("多次尝试仍未退回主菜单。")
+        self.log_recovery("多次尝试仍未退回主菜单。")
         return False
 
+    def ensure_recovery_menu_ready(self):
+        if self.is_in_menu():
+            self.log_recovery("已确认菜单锚点，无需额外菜单恢复。")
+            return True, "already_in_menu"
+
+        if self.recover_to_menu():
+            return True, "recover_to_menu"
+
+        self.log_recovery("直接退回菜单失败，尝试先确认大世界状态再重新进入菜单。")
+        if not self.recover_to_freeroam():
+            return False, "recover_to_freeroam"
+
+        self.log_recovery("已确认回到大世界，尝试重新进入菜单。")
+        if not self.enter_menu():
+            return False, "enter_menu_after_freeroam"
+
+        self.log_recovery("从大世界重新进入菜单成功。")
+        return True, "enter_menu_after_freeroam"
+
     def attempt_recovery(self):
-        self.log("任务执行异常中断，准备执行断点恢复流程...")
-        if not self.check_and_focus_game():
-            if not self.restart_game_and_boot():
-                return False
-        else:
-            if not self.recover_to_menu():
+        self.recovery_in_progress.set()
+        self.stop_process_guard_thread()
+        try:
+            recovery_stage = "focus_existing_game"
+            self.log_recovery("任务执行异常中断，准备执行断点恢复流程...")
+            if not self.check_and_focus_game():
+                recovery_stage = "restart_game_and_boot_wait_interactive"
+                if not self.restart_game_and_boot():
+                    self.capture_failure_snapshot(
+                        "recovery_failed",
+                        module_name="attempt_recovery",
+                        details={"stage": recovery_stage},
+                    )
+                    return False
+                recovery_stage = "focus_restarted_game"
+                if not self.check_and_focus_game():
+                    self.capture_failure_snapshot(
+                        "recovery_failed",
+                        module_name="attempt_recovery",
+                        details={"stage": recovery_stage},
+                    )
+                    return False
+            else:
+                self.log_recovery("检测到游戏进程仍存在，进入菜单恢复阶段。")
+
+            recovery_ok, recovery_stage = self.ensure_recovery_menu_ready()
+            if not recovery_ok:
+                self.capture_failure_snapshot(
+                    "recovery_failed",
+                    module_name="attempt_recovery",
+                    details={"stage": recovery_stage},
+                )
                 return False
 
-        self.log("环境重置成功！即将从中断处继续剩余任务。")
-        return True
+            self.process_lost_event.clear()
+            self.log_recovery("环境重置成功！即将从中断处继续剩余任务。")
+            return True
+        finally:
+            self.recovery_in_progress.clear()
 
     def wait_for_freeroam(self):
-        self.log("验证漫游状态...")
+        self.log_recovery("验证漫游状态...")
         for i in range(100):
             if not self.is_running:
                 return False
 
-            if self.find_image("anna.png", region=self.regions["全界面"], threshold=0.5):
-                self.log("验证成功：已确认处于游戏漫游界面。")
+            anchor_name, _ = self.find_world_anchor(threshold=0.55)
+            if anchor_name:
+                self.log_recovery(f"验证成功：已确认处于游戏漫游界面，命中锚点 {anchor_name}。")
                 return True
 
-            self.log(f"重试返回漫游界面({i + 1}/100)")
+            self.log_recovery(f"重试返回漫游界面({i + 1}/100)")
             self.hw_press("esc")
 
             for _ in range(20):
@@ -1411,8 +2205,8 @@ class FH_UltimateBot(ctk.CTk):
                     return False
                 time.sleep(0.1)
 
-        self.log("多次尝试验证漫游界面失败，尝试进入菜单。")
-        return True
+        self.log_recovery("多次尝试验证漫游界面失败。")
+        return False
 
     def is_in_menu(self):
         return self.find_any_image(
@@ -1749,6 +2543,27 @@ class FH_UltimateBot(ctk.CTk):
             self.log(f"find_any_image 异常: {e}")
             return None
 
+    def find_any_image_with_name(self, image_list, region=None, threshold=MATCH_THRESHOLD, fast_mode=True):
+        if not self.is_running:
+            return None, None
+
+        try:
+            screen_bgr = self.capture_region(region)
+            for img_path in image_list:
+                pos = self.find_image_in_screen(
+                    screen_bgr,
+                    img_path,
+                    region=region,
+                    threshold=threshold,
+                    fast_mode=fast_mode,
+                )
+                if pos:
+                    return img_path, pos
+            return None, None
+        except Exception as e:
+            self.log(f"find_any_image_with_name 异常: {e}")
+            return None, None
+
     def find_image_with_element(self, main_path, sub_path, region=None, threshold=0.85, fast_mode=True):
         if not self.is_running:
             return None
@@ -2035,6 +2850,9 @@ class FH_UltimateBot(ctk.CTk):
         start = time.time()
 
         while self.is_running and time.time() - start < timeout:
+            if self.should_abort_for_process_loss({"wait_target": main_path, "wait_mode": "image_with_element_multi"}):
+                return None
+
             pos = self.find_image_with_element_multi(
                 main_path=main_path,
                 sub_path=sub_path,
@@ -2049,6 +2867,8 @@ class FH_UltimateBot(ctk.CTk):
 
             sleep_end = time.time() + interval
             while self.is_running and time.time() < sleep_end:
+                if self.should_abort_for_process_loss({"wait_target": main_path, "wait_mode": "image_with_element_multi"}):
+                    return None
                 time.sleep(0.05)
 
         return None
@@ -2135,6 +2955,9 @@ class FH_UltimateBot(ctk.CTk):
         start = time.time()
 
         while self.is_running and time.time() - start < timeout:
+            if self.should_abort_for_process_loss({"wait_targets": list(image_list), "wait_mode": "any_image"}):
+                return None
+
             try:
                 screen_bgr = self.capture_region(region)
                 for img_path in image_list:
@@ -2155,6 +2978,8 @@ class FH_UltimateBot(ctk.CTk):
 
             sleep_end = time.time() + interval
             while self.is_running and time.time() < sleep_end:
+                if self.should_abort_for_process_loss({"wait_targets": list(image_list), "wait_mode": "any_image"}):
+                    return None
                 time.sleep(0.05)
 
         return None
@@ -2174,6 +2999,9 @@ class FH_UltimateBot(ctk.CTk):
         start = time.time()
 
         while self.is_running and time.time() - start < timeout:
+            if self.should_abort_for_process_loss({"wait_target": main_path, "wait_mode": "image_with_element"}):
+                return None
+
             pos = self.find_image_with_element(
                 main_path,
                 sub_path,
@@ -2186,6 +3014,8 @@ class FH_UltimateBot(ctk.CTk):
 
             sleep_end = time.time() + interval
             while self.is_running and time.time() < sleep_end:
+                if self.should_abort_for_process_loss({"wait_target": main_path, "wait_mode": "image_with_element"}):
+                    return None
                 time.sleep(0.05)
 
         return None
@@ -2208,6 +3038,8 @@ class FH_UltimateBot(ctk.CTk):
             return
 
         self.is_running = True
+        self.process_lost_event.clear()
+        self.recovery_in_progress.clear()
         self.save_config()
 
                 # 隐藏大窗的所有元素
@@ -2255,6 +3087,8 @@ class FH_UltimateBot(ctk.CTk):
                 self.stop_all()
                 return
 
+            self.start_process_guard_thread()
+
             steps = ["race", "buy", "cj", "sell"]
             curr_idx = steps.index(start_step)
 
@@ -2268,25 +3102,53 @@ class FH_UltimateBot(ctk.CTk):
             while self.is_running:
                 step_name = steps[curr_idx]
                 success = False
+                self.current_step_name = step_name
+                self.clear_failure_context()
 
-                try:
-                    if step_name == "race":
-                        success = self.logic_race(int(self.entry_race.get()))
-                    elif step_name == "buy":
-                        success = self.logic_buy_car(int(self.entry_car.get()))
-                    elif step_name == "cj":
-                        success = self.logic_super_wheelspin(int(self.entry_cj.get()))
-                    elif step_name == "sell":
-                        success = self.sell_consumable_car(int(self.entry_sc.get()))
-                except Exception as e:
-                    self.log(f"执行模块 {step_name} 时异常: {e}")
+                if self.should_abort_for_process_loss({"check_point": "before_step", "step_name": step_name}):
                     success = False
+                else:
+                    try:
+                        if step_name == "race":
+                            success = self.logic_race(int(self.entry_race.get()))
+                        elif step_name == "buy":
+                            success = self.logic_buy_car(int(self.entry_car.get()))
+                        elif step_name == "cj":
+                            success = self.logic_super_wheelspin(int(self.entry_cj.get()))
+                        elif step_name == "sell":
+                            success = self.sell_consumable_car(int(self.entry_sc.get()))
+                    except Exception as e:
+                        self.log(f"执行模块 {step_name} 时异常: {e}")
+                        self.set_failure_context(
+                            "module_exception",
+                            {
+                                "exception": str(e),
+                                "traceback": traceback.format_exc(),
+                            },
+                        )
+                        success = False
 
                 if not self.is_running:
                     break
 
+                if success and self.should_abort_for_process_loss({"check_point": "after_step", "step_name": step_name}):
+                    success = False
+
                 if not success:
+                    failure_context = self.last_failure_context or {
+                        "reason": "module_failed",
+                        "details": {"message": "模块返回 False"},
+                    }
+                    self.capture_failure_snapshot(
+                        failure_context.get("reason", "module_failed"),
+                        module_name=step_name,
+                        details=failure_context.get("details"),
+                    )
                     if self.attempt_recovery():
+                        self.process_lost_event.clear()
+                        self.start_process_guard_thread()
+                        self.clear_failure_context()
+                        self.log_recovery(f"恢复完成，重新进入 {step_name} 模块。")
                         continue
                     else:
                         self.log("致命错误：断点恢复失败，彻底停止。")
@@ -2344,6 +3206,11 @@ class FH_UltimateBot(ctk.CTk):
             return
 
         self.is_running = False
+        self.current_step_name = ""
+        self.clear_failure_context()
+        self.process_lost_event.clear()
+        self.recovery_in_progress.clear()
+        self.stop_process_guard_thread()
 
         for key in DIK_CODES.keys():
             self.hw_key_up(key)
@@ -2476,16 +3343,14 @@ class FH_UltimateBot(ctk.CTk):
         self.hw_press("enter")
         time.sleep(2.0)
 
-        pos_target = self.wait_for_image_with_element_multi(
-            "skillcar.png",
-            "liketag.png",
+        race_car_templates = self.get_race_car_template_candidates()
+        self.log(f"刷图车模板: {', '.join(race_car_templates)}")
+
+        pos_target, _ = self.wait_for_race_car_template_multi(
+            race_car_templates,
             region=self.regions["全界面"],
-            fast_mode=False,
-            main_threshold=0.60,
-            like_threshold=0.7,
-            final_threshold=0.7,
             timeout=10,
-            interval=0.25
+            interval=0.25,
         )
 
         if not pos_target:
@@ -2523,14 +3388,11 @@ class FH_UltimateBot(ctk.CTk):
                 if not self.is_running:
                     return False
 
-                pos_target = self.wait_for_image_with_element(
-                    "skillcar.png",
-                    "liketag.png",
+                pos_target, _ = self.find_race_car_template_in_list(
+                    race_car_templates,
                     region=self.regions["全界面"],
                     threshold=0.8,
-                    timeout=0.8,
-                    interval=0.2,
-                    fast_mode=True
+                    fast_mode=True,
                 )
                 if pos_target:
                     break
@@ -2555,11 +3417,17 @@ class FH_UltimateBot(ctk.CTk):
             if not self.is_running:
                 return False
 
+            if self.should_abort_for_process_loss({"phase": "logic_race_loop", "race_index": self.race_counter + 1}):
+                return False
+
             self.log(f"跑图 {self.race_counter + 1}/{target_count}: 找赛事起点...")
 
             pos = None
             for _ in range(60):
                 if not self.is_running:
+                    return False
+
+                if self.should_abort_for_process_loss({"phase": "find_race_start", "race_index": self.race_counter + 1}):
                     return False
 
                 pos = self.wait_for_any_image(
@@ -2573,6 +3441,9 @@ class FH_UltimateBot(ctk.CTk):
                 if pos:
                     break
 
+                if self.should_abort_for_process_loss({"phase": "find_race_start", "race_index": self.race_counter + 1}):
+                    return False
+
                 self.hw_press("down")
                 time.sleep(0.25)
 
@@ -2584,13 +3455,21 @@ class FH_UltimateBot(ctk.CTk):
             time.sleep(4.0)
             self.hw_key_down("w")
 
-            start_w = time.time()
+            race_start_time = time.time()
+            stall_watch_start = race_start_time
             e_pressed = 0
             last_chk = 0
             finished = False
+            stall_recovery_count = 0
+            stall_timeout = max(1, int(self.config.get("race_stall_timeout_seconds", 120)))
+            reverse_seconds = max(1, int(self.config.get("race_reverse_seconds", 3)))
 
             while self.is_running:
-                elap = time.time() - start_w
+                if self.should_abort_for_process_loss({"phase": "race_drive", "race_index": self.race_counter + 1}):
+                    break
+
+                now = time.time()
+                elap = now - race_start_time
 
                 if elap >= 3.0 and e_pressed == 0:
                     self.hw_press("e")
@@ -2605,7 +3484,46 @@ class FH_UltimateBot(ctk.CTk):
                         break
                     last_chk = time.time()
 
-                time.sleep(0.3)
+                if now - stall_watch_start >= stall_timeout:
+                    if stall_recovery_count >= 2:
+                        self.log(
+                            f"跑图 {self.race_counter + 1}/{target_count}: 已执行 {stall_recovery_count} 次倒车兜底仍未完成，升级到全局恢复。"
+                        )
+                        self.set_failure_context(
+                            "race_stall_exhausted",
+                            {
+                                "race_index": self.race_counter + 1,
+                                "target_count": target_count,
+                                "stall_timeout_seconds": stall_timeout,
+                                "reverse_seconds": reverse_seconds,
+                                "stall_recovery_count": stall_recovery_count,
+                            },
+                        )
+                        break
+
+                    stall_recovery_count += 1
+                    self.log(
+                        f"跑图 {self.race_counter + 1}/{target_count}: {stall_timeout} 秒未检测到下一圈，执行倒车兜底 {stall_recovery_count}/2（倒车 {reverse_seconds} 秒）。"
+                    )
+
+                    if not self.perform_race_stall_recovery(reverse_seconds):
+                        self.set_failure_context(
+                            "race_stall_recovery_interrupted",
+                            {
+                                "race_index": self.race_counter + 1,
+                                "target_count": target_count,
+                                "stall_timeout_seconds": stall_timeout,
+                                "reverse_seconds": reverse_seconds,
+                                "stall_recovery_count": stall_recovery_count,
+                            },
+                        )
+                        break
+
+                    stall_watch_start = time.time()
+                    last_chk = stall_watch_start
+                    continue
+
+                time.sleep(0.1)
 
             self.hw_key_up("w")
 
@@ -2620,6 +3538,10 @@ class FH_UltimateBot(ctk.CTk):
                 time.sleep(0.8)
                 self.hw_press("enter")
                 time.sleep(2.0)
+
+            if self.is_post_race_rating_enabled():
+                if not self.wait_for_post_race_rating_watchdog(self.get_post_race_rating_timeout_seconds()):
+                    return False
 
             self.race_counter += 1
             self.update_running_ui("循环跑图", self.race_counter, target_count)
@@ -2812,7 +3734,37 @@ class FH_UltimateBot(ctk.CTk):
                 return False
             self.log("进入我的车辆.")
             self.hw_press("enter")
-            time.sleep(2.0)
+            time.sleep(0.5)
+
+            pos = self.wait_for_image(
+                "DSI.png",
+                region=self.regions["左"],
+                threshold=0.75,
+                timeout=2.5,
+                interval=0.4,
+                fast_mode=True
+            )
+            if pos:
+                self.log("识别到 不要显示该消息，点击...")
+                self.game_click(pos)
+                time.sleep(0.2)
+                self.hw_press("enter")
+                time.sleep(0.3)
+
+            pos = self.wait_for_image(
+                "choosecar.png",
+                region=self.regions["左"],
+                threshold=0.75,
+                timeout=8,
+                interval=0.3,
+                fast_mode=True
+            )
+            if not pos:
+                self.log("未识别到 选择车辆")
+                return False
+
+            self.game_click(pos)
+            time.sleep(0.8)
             self.hw_press("backspace")
             time.sleep(1.0)
 
@@ -3117,6 +4069,7 @@ class FH_UltimateBot(ctk.CTk):
             self.hw_press("enter")
             time.sleep(0.8)
             self.sc_count += 1
+            self.update_running_ui("移除车辆", self.sc_count, target_count)
             self.log(f"已尝试删除车辆 {self.sc_count}/{target_count}")
 
         for _ in range(3):
