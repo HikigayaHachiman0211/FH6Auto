@@ -362,6 +362,7 @@ class FH_UltimateBot(ctk.CTk):
             "super_calc_target": "",
             "super_calc_race_sp": "10",
             "super_calc_spin_sp": "30",
+            "cj_car_right_offset": 0,
         }
         self.load_config()
 
@@ -542,6 +543,13 @@ class FH_UltimateBot(ctk.CTk):
                 self.config["super_calc_spin_sp"] = self.entry_super_calc_spin_sp.get().strip()
         except Exception:
             pass
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def save_runtime_config(self):
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=4, ensure_ascii=False)
@@ -3677,6 +3685,225 @@ class FH_UltimateBot(ctk.CTk):
             time.sleep(0.8)
 
         return True
+
+    def dismiss_cj_dsi_prompt(self):
+        pos = self.wait_for_image(
+            "DSI.png",
+            region=self.regions["全界面"],
+            threshold=0.75,
+            timeout=2.5,
+            interval=0.4,
+            fast_mode=True
+        )
+        if pos:
+            self.log("识别到 不要显示该消息，点击...")
+            self.game_click(pos)
+            time.sleep(0.2)
+            self.hw_press("enter")
+            time.sleep(0.6)
+
+    def recover_cj_vehicle_menu(self):
+        vehicle_menu_anchors = [
+            "designandpaint_w.png",
+            "designandpaint-b.png",
+            "buyandsell-w.png",
+            "buyandsell-b.png",
+        ]
+
+        for _ in range(8):
+            if not self.is_running:
+                return False
+
+            pos = self.wait_for_any_image(
+                vehicle_menu_anchors,
+                region=self.regions["全界面"],
+                threshold=0.75,
+                timeout=0.6,
+                interval=0.2,
+                fast_mode=True
+            )
+            if pos:
+                return True
+
+            self.hw_press("esc")
+            time.sleep(0.6)
+
+        self.log("未能退回车辆菜单")
+        return False
+
+    def select_cj_target_car(self):
+        brand_pos = None
+        for _ in range(30):
+            if not self.is_running:
+                return False
+
+            brand_pos = self.wait_for_any_image(
+                ["CCbrand.png"],
+                region=self.regions["全界面"],
+                threshold=0.75,
+                timeout=0.8,
+                interval=0.2,
+                fast_mode=True
+            )
+            if brand_pos:
+                break
+
+            self.hw_press("up")
+            time.sleep(0.25)
+
+        if not brand_pos:
+            self.log("未找到斯巴鲁品牌")
+            return False
+
+        self.game_click(brand_pos)
+        time.sleep(0.4)
+
+        try:
+            car_right_offset = int(self.config.get("cj_car_right_offset", 0))
+        except Exception:
+            car_right_offset = 0
+        car_right_offset = max(0, min(200, car_right_offset))
+
+        if car_right_offset:
+            self.log(f"按已记录偏移跳过车辆: right x {car_right_offset}")
+            for _ in range(car_right_offset):
+                if not self.is_running:
+                    return False
+                self.hw_press("right", delay=0.05)
+                time.sleep(0.08)
+            time.sleep(0.35)
+
+        found_car = False
+        current_right_offset = car_right_offset
+        for _ in range(85):
+            if not self.is_running:
+                return False
+
+            pos_target = self.wait_for_image_with_element_multi(
+                "newCC.png",
+                "newcartag.png",
+                region=self.regions["全界面"],
+                fast_mode=False,
+                main_threshold=0.60,
+                like_threshold=0.70,
+                final_threshold=0.68,
+                timeout=3,
+                interval=0.25
+            )
+            if pos_target:
+                self.game_click(pos_target)
+                found_car = True
+                if self.config.get("cj_car_right_offset", 0) != current_right_offset:
+                    self.config["cj_car_right_offset"] = current_right_offset
+                    self.save_runtime_config()
+                    self.log(f"记录首次目标车辆偏移: right x {current_right_offset}")
+                break
+
+            for _ in range(4):
+                if not self.is_running:
+                    return False
+                self.hw_press("right", delay=0.05)
+                time.sleep(0.08)
+            current_right_offset += 4
+            time.sleep(0.35)
+
+        if not found_car:
+            self.log("列表中未找到带全新标签的目标车辆")
+            return False
+
+        return True
+
+    def select_cj_car_via_design_and_paint(self):
+        self.log("进入设计与喷漆...")
+
+        pos_design = None
+        for i in range(12):
+            if not self.is_running:
+                return False
+
+            pos_design = self.wait_for_any_image(
+                ["designandpaint_w.png", "designandpaint-b.png"],
+                region=self.regions["全界面"],
+                threshold=0.75,
+                timeout=0.8,
+                interval=0.2,
+                fast_mode=True
+            )
+            if pos_design:
+                break
+
+            self.hw_press("right" if i < 6 else "left", delay=0.15)
+            time.sleep(0.3)
+
+        if not pos_design:
+            self.log("未找到设计与喷漆")
+            return False
+
+        self.game_click(pos_design)
+        time.sleep(0.6)
+
+        self.dismiss_cj_dsi_prompt()
+
+        pos_choose_entry = self.wait_for_any_image(
+            ["choosecar.png", "choosecar-b.png"],
+            region=self.regions["全界面"],
+            threshold=0.75,
+            timeout=10,
+            interval=0.3,
+            fast_mode=True
+        )
+        if not pos_choose_entry:
+            self.log("未识别到 选择车辆")
+            return False
+
+        self.game_click(pos_choose_entry)
+        time.sleep(0.6)
+        self.hw_press("backspace")
+        time.sleep(0.4)
+
+        if not self.select_cj_target_car():
+            return False
+
+        time.sleep(0.5)
+        self.hw_press("enter")
+        time.sleep(1.0)
+
+        pos_choose_exit = self.wait_for_any_image(
+            ["choosecar.png", "choosecar-b.png"],
+            region=self.regions["全界面"],
+            threshold=0.75,
+            timeout=15,
+            interval=0.5,
+            fast_mode=True
+        )
+        if not pos_choose_exit:
+            self.log("选车后未返回设计与喷漆")
+            return False
+
+        self.hw_press("esc")
+        time.sleep(0.8)
+        return True
+
+    def select_cj_car_via_normal_flow(self):
+        self.log("进入我的车辆.")
+        self.hw_press("enter")
+        time.sleep(2.0)
+
+        self.dismiss_cj_dsi_prompt()
+
+        self.hw_press("backspace")
+        time.sleep(1.0)
+
+        if not self.select_cj_target_car():
+            return False
+
+        time.sleep(1.2)
+        self.hw_press("enter")
+        time.sleep(1.0)
+        self.hw_press("enter")
+        time.sleep(1.0)
+        return True
+
     # ==========================================
     # --- 模块：抽奖 ---
     # ==========================================
@@ -3726,111 +3953,45 @@ class FH_UltimateBot(ctk.CTk):
         self.game_click(pos_bs)
         time.sleep(1.0)
         self.hw_press("pagedown", delay=0.15)
-        self.log("进入车辆界面...")
+        self.log("确认进入车辆菜单，准备选车...")
         time.sleep(0.5)
+
+        design_selection_failures = 0
+        force_normal_selection = False
 
         while self.cj_counter < target_count:
             if not self.is_running:
                 return False
-            self.log("进入我的车辆.")
-            self.hw_press("enter")
-            time.sleep(0.5)
+            used_normal_selection = force_normal_selection
 
-            pos = self.wait_for_image(
-                "DSI.png",
-                region=self.regions["左"],
-                threshold=0.75,
-                timeout=2.5,
-                interval=0.4,
-                fast_mode=True
-            )
-            if pos:
-                self.log("识别到 不要显示该消息，点击...")
-                self.game_click(pos)
-                time.sleep(0.2)
-                self.hw_press("enter")
-                time.sleep(0.3)
-
-            pos = self.wait_for_image(
-                "choosecar.png",
-                region=self.regions["左"],
-                threshold=0.75,
-                timeout=8,
-                interval=0.3,
-                fast_mode=True
-            )
-            if not pos:
-                self.log("未识别到 选择车辆")
-                return False
-
-            self.game_click(pos)
-            time.sleep(0.8)
-            self.hw_press("backspace")
-            time.sleep(1.0)
-
-            brand_pos = None
-            for _ in range(30):
-                if not self.is_running:
+            if force_normal_selection:
+                self.log("本轮已切换为正常选车流程。")
+                if not self.select_cj_car_via_normal_flow():
                     return False
+            else:
+                if not self.select_cj_car_via_design_and_paint():
+                    design_selection_failures += 1
+                    self.log(f"设计与涂装选车失败 ({design_selection_failures}/2)，尝试回退正常选车流程。")
+                    if design_selection_failures >= 2:
+                        force_normal_selection = True
+                        self.log("设计与涂装选车已失败两次，本轮后续默认使用正常选车流程。")
 
-                brand_pos = self.wait_for_any_image(
-                    ["CCbrand.png"],
-                    region=self.regions["全界面"],
-                    threshold=0.75,
-                    timeout=0.8,
-                    interval=0.2,
-                    fast_mode=True
-                )
-                if brand_pos:
-                    break
+                    if not self.recover_cj_vehicle_menu():
+                        return False
 
-                self.hw_press("up")
-                time.sleep(0.25)
-
-            if not brand_pos:
-                self.log("选品牌失败")
-                return False
-
-            self.game_click(brand_pos)
-            time.sleep(1.0)
-
-            found_car = False
-            for _ in range(85):
-                if not self.is_running:
-                    return False
-                pos_target = self.find_image_with_element(
-                    "newCC.png",
-                    "newcartag.png",
-                    region=self.regions["全界面"],
-                    threshold=0.85,     # 调低阈值包容标签遮挡
-                    fast_mode=False     # 释放多重缩放火力
-                )
-                if pos_target:
-                    self.game_click(pos_target)
-                    found_car = True
-                    break
-                for _ in range(4):
-                    self.hw_press("right", delay=0.05)
-                    time.sleep(0.08)
-                time.sleep(0.4)
-            if not found_car:
-                self.log("列表中未找到目标车辆")
-                return False
-            time.sleep(1.2)
-            self.hw_press("enter")
-            time.sleep(1.0)
-            self.hw_press("enter")
-            time.sleep(1.0)
+                    used_normal_selection = True
+                    if not self.select_cj_car_via_normal_flow():
+                        return False
 
 
             pos_sjy = None
-            for _ in range(60):
+            for i in range(30):
                 if not self.is_running:
                     return False
 
                 pos_sjy = self.wait_for_any_image(
                     ["UandT-w.png", "UandT-b.png"],
-                    region=self.regions["左下"],
+                    region=self.regions["全界面"],
                     threshold=0.75,
                     timeout=0.8,
                     interval=0.2,
@@ -3839,11 +4000,11 @@ class FH_UltimateBot(ctk.CTk):
                 if pos_sjy:
                     break
 
-                self.hw_press("esc")
-                time.sleep(0.5)
+                self.hw_press("right" if i < 15 else "left", delay=0.15)
+                time.sleep(0.3)
 
             if not pos_sjy:
-                self.log("找不到升级页面")
+                self.log("找不到升级与调教")
                 return False
 
             self.game_click(pos_sjy)
@@ -3900,14 +4061,24 @@ class FH_UltimateBot(ctk.CTk):
                     time.sleep(1.0)
                     return True
                 self.cj_counter += 1
+                if self.cj_counter % 3 == 0:
+                    try:
+                        next_offset = int(self.config.get("cj_car_right_offset", 0)) + 1
+                    except Exception:
+                        next_offset = 1
+                    next_offset = max(0, min(200, next_offset))
+                    self.config["cj_car_right_offset"] = next_offset
+                    self.save_runtime_config()
+                    self.log(f"已升级 3 辆同列车辆，车辆偏移更新为: right x {next_offset}")
                 self.update_running_ui("超级抽奖", self.cj_counter, target_count)
 
             self.hw_press("esc")
             time.sleep(1.2)
             self.hw_press("esc")
             time.sleep(0.8)
-            self.hw_press("up", delay=0.15)
-            time.sleep(0.8)
+            if used_normal_selection:
+                self.hw_press("up", delay=0.15)
+                time.sleep(0.8)
         self.hw_press("esc")
         time.sleep(1.2)
         self.hw_press("esc")
