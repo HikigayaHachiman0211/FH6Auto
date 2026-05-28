@@ -5579,6 +5579,7 @@ class FH_UltimateBot(ctk.CTk):
                 "lap_seconds": self.get_cr_lap_seconds_for_car("toyota"),
                 "brand_templates": ["ToyotaWhite.png", "ToyotaBlack.png"],
                 "car_template": "ToyotaRaceCar.png",
+                "negative_templates": ["ToyotaAE86SpecialMisdetect.png"],
             }
 
         return {
@@ -5587,6 +5588,7 @@ class FH_UltimateBot(ctk.CTk):
             "lap_seconds": self.get_cr_lap_seconds_for_car("wuling"),
             "brand_templates": ["Wuling.png", "WulingBlack.png"],
             "car_template": "WulingRaceCar.png",
+            "negative_templates": ["ToyotaAE86SpecialMisdetect.png"],
         }
 
     def get_selected_cr_car_type(self):
@@ -5996,52 +5998,43 @@ class FH_UltimateBot(ctk.CTk):
         self.hw_press("backspace")
         time.sleep(0.8)
 
-        brand_pos = None
-        for _ in range(30):
-            if not self.is_running:
-                return False
-
-            brand_pos = self.wait_for_any_image(
-                car_profile["brand_templates"],
-                region=self.regions["全界面"],
-                threshold=0.72,
-                timeout=0.8,
-                interval=0.2,
-                fast_mode=True,
-            )
-            if brand_pos:
-                break
-
-            self.hw_press("up")
-            time.sleep(0.25)
-
-        if not brand_pos:
-            self.log(f"未找到 {car_profile['label']} 品牌")
-            self.capture_failure_snapshot(
-                "cr_car_brand_not_found",
-                module_name="cr",
-                details={"car": car_profile["label"], "brand_templates": car_profile["brand_templates"]},
-            )
-            return False
-
-        self.game_click(brand_pos)
-        time.sleep(1.0)
-
+        self.log(f"刷CR：跳过车厂筛选，直接查找 {car_profile['label']} 目标车模板。")
+        negative_templates = car_profile.get("negative_templates", [])
+        scan_attempts = 120
         car_pos = None
-        for _ in range(120):
+        skipped_negative = 0
+
+        for attempt in range(scan_attempts):
             if not self.is_running:
                 return False
 
             car_pos = self.wait_for_image(
                 car_profile["car_template"],
                 region=self.regions["全界面"],
-                threshold=0.68,
+                threshold=0.74,
                 timeout=0.8,
                 interval=0.2,
-                fast_mode=True,
+                fast_mode=False,
             )
             if car_pos:
-                break
+                negative_pos = self.find_any_image(
+                    negative_templates,
+                    region=self.regions["全界面"],
+                    threshold=0.72,
+                    fast_mode=False,
+                ) if negative_templates else None
+
+                same_candidate = (
+                    negative_pos
+                    and abs(negative_pos[0] - car_pos[0]) <= 220
+                    and abs(negative_pos[1] - car_pos[1]) <= 180
+                )
+                if same_candidate:
+                    skipped_negative += 1
+                    self.log("刷CR：检测到 AE86 误识别候选，跳过当前车辆。")
+                    car_pos = None
+                else:
+                    break
 
             for _ in range(4):
                 if not self.is_running:
@@ -6055,7 +6048,13 @@ class FH_UltimateBot(ctk.CTk):
             self.capture_failure_snapshot(
                 "cr_car_not_found",
                 module_name="cr",
-                details={"car": car_profile["label"], "car_template": car_profile["car_template"]},
+                details={
+                    "car": car_profile["label"],
+                    "car_template": car_profile["car_template"],
+                    "negative_templates": negative_templates,
+                    "scan_attempts": scan_attempts,
+                    "skipped_negative": skipped_negative,
+                },
             )
             return False
 
