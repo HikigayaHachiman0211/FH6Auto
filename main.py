@@ -59,7 +59,7 @@ CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
 DIAGNOSTICS_DIR = os.path.join(APP_DIR, "diagnostics")
-CURRENT_VERSION = "1.1.0"
+CURRENT_VERSION = "1.1.1"
 APP_DISPLAY_NAME = "FH6Auto by YSTO | 深度优化 SArB1e"
 ORIGINAL_AUTHOR_NAME = "原作者 YSTO"
 OPTIMIZER_NAME = "深度优化者 SArB1e"
@@ -2341,6 +2341,67 @@ class FH_UltimateBot(ctk.CTk):
         self.set_failure_context("process_guard_detected", detail_map)
         return True
 
+    def quick_network_check(self):
+        result = {
+            "adapter": "unknown",
+            "internet": "unknown",
+            "details": [],
+        }
+
+        try:
+            CREATE_NO_WINDOW = 0x08000000
+            cmd = (
+                'powershell -NoProfile -Command '
+                '"Get-NetAdapter | Where-Object {$_.Status -eq \'Up\'} | '
+                'Select-Object -First 1 -ExpandProperty Name"'
+            )
+            output = subprocess.check_output(
+                cmd,
+                shell=True,
+                text=True,
+                timeout=3,
+                creationflags=CREATE_NO_WINDOW,
+            ).strip()
+            if output:
+                result["adapter"] = "up"
+                result["details"].append(f"network_adapter={output}")
+            else:
+                result["adapter"] = "down"
+                result["internet"] = "offline"
+                result["details"].append("network_adapter=none_up")
+                return result
+        except Exception as e:
+            result["details"].append(f"adapter_check_error={e}")
+
+        probe_urls = [
+            "https://www.microsoft.com/favicon.ico",
+            "https://www.github.com/favicon.ico",
+            "https://www.baidu.com/favicon.ico",
+        ]
+        for url in probe_urls:
+            try:
+                resp = requests.get(url, timeout=2)
+                result["details"].append(f"{url}={resp.status_code}")
+                if 200 <= resp.status_code < 500:
+                    result["internet"] = "online"
+                    return result
+            except Exception as e:
+                result["details"].append(f"{url}=error:{type(e).__name__}")
+
+        result["internet"] = "offline"
+        return result
+
+    def log_process_exit_network_state(self):
+        net = self.quick_network_check()
+        detail_text = "; ".join(net.get("details", [])) or "no_detail"
+        if net.get("internet") == "online":
+            self.log(f"进程守护：快速网络检查正常，网络可访问。{detail_text}")
+        elif net.get("adapter") == "down":
+            self.log(f"进程守护：快速网络检查异常，未检测到已连接网络适配器。{detail_text}")
+        else:
+            self.log(f"进程守护：快速网络检查异常，可能断网或网络不可达。{detail_text}")
+        return net
+
     def stop_process_guard_thread(self):
         stop_event = self.process_guard_stop_event
         if stop_event is not None:
@@ -2383,10 +2444,21 @@ class FH_UltimateBot(ctk.CTk):
             if self.is_running:
                 restart_hint = "准备恢复" if self.is_auto_restart_enabled() else "自动重启未开启，将中断当前任务"
                 self.log(f"进程守护：检测间隔 {interval} 秒，发现 forzahorizon6.exe 已退出，{restart_hint}。")
+                network_state = self.log_process_exit_network_state()
+                self.set_failure_context(
+                    "process_guard_detected",
+                    {
+                        "message": "进程守护检测到 forzahorizon6.exe 已退出",
+                        "guard_interval_seconds": interval,
+                        "current_step": self.current_step_name,
+                        "network_state": network_state,
+                    },
+                )
                 self.process_lost_event.set()
                 return
 
             self.log("进程守护：检测到 forzahorizon6.exe 已退出，当前没有运行任务，仅记录状态。")
+            self.log_process_exit_network_state()
             self.process_guard_seen_process = False
 
     def start_process_guard_thread(self):
@@ -3864,7 +3936,7 @@ class FH_UltimateBot(ctk.CTk):
                     },
                 )
             finally:
-                if self.is_running and not success:
+                while self.is_running and not success:
                     failure_context = self.last_failure_context or {
                         "reason": "cr_grind_failed",
                         "details": {"message": "刷CR点流程未成功完成"},
@@ -3874,6 +3946,17 @@ class FH_UltimateBot(ctk.CTk):
                         module_name="cr",
                         details=failure_context.get("details"),
                     )
+                    if self.attempt_recovery():
+                        self.process_lost_event.clear()
+                        self.start_process_guard_thread()
+                        self.clear_failure_context()
+                        self.log_recovery("刷CR点恢复完成，重新进入刷CR流程。")
+                        success = self.logic_cr_grind()
+                        continue
+
+                    self.log("刷CR点恢复失败，停止任务。")
+                    break
+
                 self.stop_all()
 
         self.current_thread = threading.Thread(target=runner, daemon=True)
@@ -4392,10 +4475,8 @@ class FH_UltimateBot(ctk.CTk):
             fast_mode=False
         )
         if pos:
-            self.log("识别到 不再显示该消息，勾选后确认...")
-            # DSI.png matches the label text; the checkbox is immediately left of it.
-            checkbox_pos = (max(0, pos[0] - 160), pos[1])
-            self.game_click(checkbox_pos)
+            self.log("识别到 不再显示该消息，点击文字按钮后确认...")
+            self.game_click(pos)
             time.sleep(0.2)
             self.hw_press("enter")
             time.sleep(0.6)
