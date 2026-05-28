@@ -4386,17 +4386,21 @@ class FH_UltimateBot(ctk.CTk):
         pos = self.wait_for_image(
             "DSI.png",
             region=self.regions["全界面"],
-            threshold=0.75,
-            timeout=2.5,
+            threshold=0.68,
+            timeout=3.5,
             interval=0.4,
-            fast_mode=True
+            fast_mode=False
         )
         if pos:
-            self.log("识别到 不要显示该消息，点击...")
-            self.game_click(pos)
+            self.log("识别到 不再显示该消息，勾选后确认...")
+            # DSI.png matches the label text; the checkbox is immediately left of it.
+            checkbox_pos = (max(0, pos[0] - 160), pos[1])
+            self.game_click(checkbox_pos)
             time.sleep(0.2)
             self.hw_press("enter")
             time.sleep(0.6)
+            return True
+        return False
 
     def recover_cj_vehicle_menu(self):
         vehicle_menu_anchors = [
@@ -4576,8 +4580,19 @@ class FH_UltimateBot(ctk.CTk):
             fast_mode=True
         )
         if not pos_choose_entry:
-            self.log("未识别到 选择车辆")
-            return False
+            self.log("未识别到 选择车辆，尝试处理可能残留的首次提示")
+            if self.dismiss_cj_dsi_prompt():
+                pos_choose_entry = self.wait_for_any_image(
+                    ["choosecar.png", "choosecar-b.png"],
+                    region=self.regions["全界面"],
+                    threshold=0.75,
+                    timeout=6,
+                    interval=0.3,
+                    fast_mode=True
+                )
+            if not pos_choose_entry:
+                self.log("未识别到 选择车辆")
+                return False
 
         self.game_click(pos_choose_entry)
         time.sleep(0.6)
