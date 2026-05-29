@@ -59,7 +59,7 @@ CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
 DIAGNOSTICS_DIR = os.path.join(APP_DIR, "diagnostics")
-CURRENT_VERSION = "1.1.1"
+CURRENT_VERSION = "1.1.2"
 APP_DISPLAY_NAME = "FH6Auto by YSTO | 深度优化 SArB1e"
 ORIGINAL_AUTHOR_NAME = "原作者 YSTO"
 OPTIMIZER_NAME = "深度优化者 SArB1e"
@@ -1835,7 +1835,7 @@ class FH_UltimateBot(ctk.CTk):
         def check_update_logic():
             self.ui_call(self.lbl_version.configure, text="正在连接 Github...", text_color="#3498DB")
             try:
-                url = "https://raw.githubusercontent.com/YOUSTHEONE/FH6Auto/refs/heads/main/version.json"
+                url = "https://raw.githubusercontent.com/HikigayaHachiman0211/FH6Auto/refs/heads/main/version.json"
                 resp = requests.get(url, timeout=5)
                 if resp.status_code == 200:
                     data = resp.json()
