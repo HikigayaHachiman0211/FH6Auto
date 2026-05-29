@@ -379,6 +379,9 @@ class FH_UltimateBot(ctk.CTk):
             "general_click_wait_multiplier": 1.0,
             "general_vehicle_move_wait_seconds": 0.08,
             "filter_strict_click_verify": False,
+            "like_guard_enabled": True,
+            "like_guard_stall_seconds": 180,
+            "like_guard_max_prompt_passes": 3,
         }
         self.load_config()
 
@@ -559,6 +562,13 @@ class FH_UltimateBot(ctk.CTk):
             self.config["step_retry_enabled"] = bool(self.var_step_retry_enabled.get())
         if hasattr(self, "var_filter_strict_click_verify"):
             self.config["filter_strict_click_verify"] = bool(self.var_filter_strict_click_verify.get())
+        if hasattr(self, "var_like_guard_enabled"):
+            self.config["like_guard_enabled"] = bool(self.var_like_guard_enabled.get())
+        if hasattr(self, "entry_like_guard_stall_seconds"):
+            self.config["like_guard_stall_seconds"] = self.get_positive_entry_value(
+                self.entry_like_guard_stall_seconds,
+                self.config.get("like_guard_stall_seconds", 180),
+            )
         if hasattr(self, "option_race_car_type"):
             self.config["race_car_type"] = "s1_790" if self.option_race_car_type.get() == "S1 790" else "s2_900"
         if hasattr(self, "option_cr_car_type"):
@@ -1390,12 +1400,41 @@ class FH_UltimateBot(ctk.CTk):
         self.pipeline_tip_frame = ctk.CTkFrame(self, fg_color="#2B2418", height=34, corner_radius=8)
         self.pipeline_tip_frame.pack(fill="x", padx=18, pady=(10, 0))
         self.pipeline_tip_frame.pack_propagate(False)
+        self.var_like_guard_enabled = ctk.BooleanVar(value=self.config.get("like_guard_enabled", True))
+        self.cb_like_guard = ctk.CTkCheckBox(
+            self.pipeline_tip_frame,
+            text="点赞检测",
+            variable=self.var_like_guard_enabled,
+            command=self.save_config,
+        )
+        self.cb_like_guard.pack(side="right", padx=(8, 14))
+        self.entry_like_guard_stall_seconds = ctk.CTkEntry(self.pipeline_tip_frame, width=54, height=24, justify="center")
+        self.entry_like_guard_stall_seconds.insert(0, str(self.config.get("like_guard_stall_seconds", 180)))
+        self.entry_like_guard_stall_seconds.pack(side="right", padx=(4, 0))
+        ctk.CTkLabel(
+            self.pipeline_tip_frame,
+            text="卡住秒:",
+            text_color="#F5B041",
+            font=ctk.CTkFont(size=12),
+        ).pack(side="right", padx=(8, 0))
         ctk.CTkLabel(
             self.pipeline_tip_frame,
             text="建议：买车数量 > 超抽数量 > 删除数量，给模板匹配容错，避免后续无对应车辆仍继续循环。",
             text_color="#F5B041",
             font=ctk.CTkFont(size=13, weight="bold"),
-        ).pack(side="left", padx=14)
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=14)
+
+        self.cr_ticket_warning_frame = ctk.CTkFrame(self, fg_color="#3A1111", height=38, corner_radius=8)
+        self.cr_ticket_warning_frame.pack(fill="x", padx=18, pady=(8, 0))
+        self.cr_ticket_warning_frame.pack_propagate(False)
+        ctk.CTkLabel(
+            self.cr_ticket_warning_frame,
+            text="重要提醒：买车 CR 点不足时可能会消耗车辆票券（贵重物品），请一定一定预留充足 CR 点再刷技术点！",
+            text_color="#FFB4A8",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=14)
 
 
         # ====== 新增：智能计算分配工具栏 (放在下方) ======
@@ -1443,6 +1482,17 @@ class FH_UltimateBot(ctk.CTk):
         self.entry_calc_a.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_calc_a, 10))
         self.entry_calc_b.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_calc_b, 7))
         self.entry_calc_c.bind("<KeyRelease>", lambda e: limit_len(e, self.entry_calc_c, 2))
+        self.entry_like_guard_stall_seconds.bind(
+            "<FocusOut>",
+            lambda e: self.normalize_positive_entry(
+                self.entry_like_guard_stall_seconds,
+                self.config.get("like_guard_stall_seconds", 180),
+            ),
+        )
+        self.entry_like_guard_stall_seconds.bind(
+            "<KeyRelease>",
+            lambda e: limit_len(e, self.entry_like_guard_stall_seconds, 4),
+        )
 
         self.super_calc_frame = ctk.CTkFrame(self, fg_color="#26222B", height=45, corner_radius=10)
         self.super_calc_frame.pack(fill="x", padx=18, pady=(10, 0))
@@ -2183,6 +2233,13 @@ class FH_UltimateBot(ctk.CTk):
                 "log_path": LOG_FILE,
                 "screenshot_path": screenshot_path if screenshot_saved else None,
                 "screenshot_error": screenshot_error,
+                "report_hint": {
+                    "github_issues": "https://github.com/HikigayaHachiman0211/FH6Auto/issues",
+                    "runtime_log": LOG_FILE,
+                    "error_log_json": meta_path,
+                    "diagnostics_dir": DIAGNOSTICS_DIR,
+                    "screenshot": screenshot_path if screenshot_saved else None,
+                },
             }
 
             with open(meta_path, "w", encoding="utf-8") as f:
@@ -2202,6 +2259,26 @@ class FH_UltimateBot(ctk.CTk):
         except Exception as e:
             self.log(f"[诊断] 保存失败现场时异常: {e}")
             return None
+
+    def log_error_report_guidance(self, snapshot_info=None):
+        now = time.time()
+        last_hint_at = getattr(self, "last_error_report_hint_at", 0)
+        if now - last_hint_at < 30:
+            return
+        self.last_error_report_hint_at = now
+
+        self.log("如果需要开发者定位，请到 GitHub 提交更详细错误信息：")
+        self.log("GitHub Issues: https://github.com/HikigayaHachiman0211/FH6Auto/issues")
+        self.log(f"运行时 log: {LOG_FILE}")
+        self.log(f"错误 log/截图目录: {DIAGNOSTICS_DIR}\\日期\\")
+        if snapshot_info:
+            meta_path = snapshot_info.get("meta_path")
+            screenshot_path = snapshot_info.get("screenshot_path")
+            if meta_path:
+                self.log(f"本次错误 JSON: {meta_path}")
+            if screenshot_path:
+                self.log(f"本次错误截图: {screenshot_path}")
+        self.log("请同时提供运行时 log、错误 JSON、错误截图；如果能复现，也请附上复现步骤和当时所在页面截图。")
 
     def perform_race_stall_recovery(self, reverse_seconds):
         self.hw_key_up("w")
@@ -3543,6 +3620,116 @@ class FH_UltimateBot(ctk.CTk):
             log_text=log_text
         )
 
+    def is_like_guard_enabled(self):
+        var_widget = getattr(self, "var_like_guard_enabled", None)
+        if var_widget is not None:
+            try:
+                return bool(var_widget.get())
+            except Exception:
+                pass
+        return bool(self.config.get("like_guard_enabled", True))
+
+    def get_like_guard_stall_seconds(self):
+        entry_widget = getattr(self, "entry_like_guard_stall_seconds", None)
+        if entry_widget is not None:
+            return self.get_positive_entry_value(
+                entry_widget,
+                self.config.get("like_guard_stall_seconds", 180),
+            )
+        return self.get_config_int("like_guard_stall_seconds", 180)
+
+    def get_like_guard_max_prompt_passes(self):
+        return self.get_config_int("like_guard_max_prompt_passes", 3)
+
+    def get_like_prompt_like_templates(self):
+        return ["LikeB2.png", "LikeW2.png"]
+
+    def get_like_prompt_anchor_templates(self):
+        return ["DislikeW2.png", "CancelB2.png", "CancelW2.png"]
+
+    def find_like_prompt_candidate(self, region=None, like_threshold=0.66, anchor_threshold=0.68):
+        if not self.is_running:
+            return None
+
+        region = region or self.regions["全界面"]
+        try:
+            screen_bgr = self.capture_region(region)
+            for template_name in self.get_like_prompt_like_templates():
+                pos = self.find_image_in_screen(
+                    screen_bgr,
+                    template_name,
+                    region=region,
+                    threshold=like_threshold,
+                    fast_mode=True,
+                )
+                if pos:
+                    return {"action": "like", "template": template_name, "pos": pos}
+
+            for template_name in self.get_like_prompt_anchor_templates():
+                pos = self.find_image_in_screen(
+                    screen_bgr,
+                    template_name,
+                    region=region,
+                    threshold=anchor_threshold,
+                    fast_mode=True,
+                )
+                if pos:
+                    return {"action": "anchor", "template": template_name, "pos": pos}
+        except Exception as e:
+            self.log(f"点赞检测识别异常: {e}")
+
+        return None
+
+    def handle_like_prompt_sequence(self, context="未知状态"):
+        if not self.is_like_guard_enabled():
+            return 0
+
+        max_passes = self.get_like_guard_max_prompt_passes()
+        handled_count = 0
+        for attempt in range(1, max_passes + 1):
+            if not self.is_running:
+                break
+
+            candidate = self.find_like_prompt_candidate(region=self.regions["全界面"])
+            if not candidate:
+                break
+
+            if candidate.get("action") != "like":
+                self.log(
+                    f"点赞检测：{context} 疑似点赞弹窗，但只命中 {candidate.get('template')}，未点击点踩/取消。"
+                )
+                break
+
+            self.log(
+                f"点赞检测：{context} 命中点赞按钮 {candidate.get('template')} "
+                f"({attempt}/{max_passes})，执行点赞。"
+            )
+            self.game_click(candidate.get("pos"))
+            handled_count += 1
+            if not self.wait_with_running(1.2):
+                break
+
+        if handled_count:
+            self.log(f"点赞检测：{context} 已处理 {handled_count} 个点赞弹窗。")
+        return handled_count
+
+    def handle_like_prompt_after_stall(self, context, stall_started_at):
+        if not self.is_like_guard_enabled():
+            return 0
+
+        stall_seconds = self.get_like_guard_stall_seconds()
+        elapsed = time.time() - stall_started_at
+        remaining = stall_seconds - elapsed
+        if remaining > 0:
+            self.log(
+                f"点赞检测：{context} 已等待 {int(elapsed)} 秒，"
+                f"将在 {stall_seconds} 秒卡住阈值后检查点赞弹窗。"
+            )
+            if not self.wait_with_running(remaining):
+                return 0
+
+        return self.handle_like_prompt_sequence(context)
+
     def wait_for_image_with_element(self, main_path, sub_path, region=None, threshold=0.85, timeout=30, interval=0.4, fast_mode=True):
         start = time.time()
 
@@ -3587,6 +3774,8 @@ class FH_UltimateBot(ctk.CTk):
         self.global_settings_frame.pack_forget()
         if hasattr(self, "pipeline_tip_frame"):
             self.pipeline_tip_frame.pack_forget()
+        if hasattr(self, "cr_ticket_warning_frame"):
+            self.cr_ticket_warning_frame.pack_forget()
         self.calc_frame.pack_forget()
         if hasattr(self, "super_calc_frame"):
             self.super_calc_frame.pack_forget()
@@ -3640,6 +3829,9 @@ class FH_UltimateBot(ctk.CTk):
             "【移除车辆重要提醒】\n"
             "删除逻辑会筛选并批量移除【重复项 + B级 + 全轮驱动 + 传奇】车辆，大概率是 22B。\n"
             "启动前必须人工审核筛选结果；如果有其他车辆混入，请先改装至非 B 级或不要启动删车。\n\n"
+            "【买车 CR 重要提醒】\n"
+            "如果买车时 CR 点不足，游戏可能会消耗车辆票券（贵重物品）。\n"
+            "请一定一定要预留充足 CR 点再进行刷技术点！\n\n"
             "否则可能出现模板误判、点赞弹窗卡住、超级抽奖选错车/买错车等问题。\n\n"
             "确认已经处理好后再继续启动。"
         )
@@ -3654,7 +3846,8 @@ class FH_UltimateBot(ctk.CTk):
             "刷CR点启动前强提醒：\n\n"
             "1. 五菱、丰田两辆刷CR点车辆必须保持【出场涂装】，不要换涂装。\n"
             "2. 如果想让 CR 点收益最高，可以把驾驶辅助预设直接调整到【终极】，这样能获取最多 CR 点奖励。\n"
-            "3. 如果后续还要继续刷技术点，记得把设置改回【自动挡】和【自动转向】。\n\n"
+            "3. 建议提前给刷CR点车辆调教点赞，避免周期结算后弹出点赞窗口卡住流程。\n"
+            "4. 如果后续还要继续刷技术点，记得把设置改回【自动挡】和【自动转向】。\n\n"
             "确认已经处理好后再继续启动刷CR点。"
         )
         try:
@@ -3773,7 +3966,7 @@ class FH_UltimateBot(ctk.CTk):
                         "reason": "module_failed",
                         "details": {"message": "模块返回 False"},
                     }
-                    self.capture_failure_snapshot(
+                    snapshot_info = self.capture_failure_snapshot(
                         failure_context.get("reason", "module_failed"),
                         module_name=step_name,
                         details=failure_context.get("details"),
@@ -3786,6 +3979,7 @@ class FH_UltimateBot(ctk.CTk):
                         continue
                     else:
                         self.log("致命错误：断点恢复失败，彻底停止。")
+                        self.log_error_report_guidance(snapshot_info)
                         break
                 #v1.0.1
                 # ====== 核心流转与无限循环逻辑 ======
@@ -3942,7 +4136,7 @@ class FH_UltimateBot(ctk.CTk):
                         "reason": "cr_grind_failed",
                         "details": {"message": "刷CR点流程未成功完成"},
                     }
-                    self.capture_failure_snapshot(
+                    snapshot_info = self.capture_failure_snapshot(
                         failure_context.get("reason", "cr_grind_failed"),
                         module_name="cr",
                         details=failure_context.get("details"),
@@ -3956,6 +4150,7 @@ class FH_UltimateBot(ctk.CTk):
                         continue
 
                     self.log("刷CR点恢复失败，停止任务。")
+                    self.log_error_report_guidance(snapshot_info)
                     break
 
                 self.stop_all()
@@ -3994,6 +4189,8 @@ class FH_UltimateBot(ctk.CTk):
             self.global_settings_frame.pack_forget()
             if hasattr(self, "pipeline_tip_frame"):
                 self.pipeline_tip_frame.pack_forget()
+            if hasattr(self, "cr_ticket_warning_frame"):
+                self.cr_ticket_warning_frame.pack_forget()
             self.calc_frame.pack_forget()
             if hasattr(self, "super_calc_frame"):
                 self.super_calc_frame.pack_forget()
@@ -4008,6 +4205,8 @@ class FH_UltimateBot(ctk.CTk):
             self.global_settings_frame.pack(fill="x", padx=18, pady=(15, 0))
             if hasattr(self, "pipeline_tip_frame"):
                 self.pipeline_tip_frame.pack(fill="x", padx=18, pady=(10, 0))
+            if hasattr(self, "cr_ticket_warning_frame"):
+                self.cr_ticket_warning_frame.pack(fill="x", padx=18, pady=(8, 0))
             self.calc_frame.pack(fill="x", padx=18, pady=(10, 0))
             if hasattr(self, "super_calc_frame"):
                 self.super_calc_frame.pack(fill="x", padx=18, pady=(10, 0))
@@ -4043,6 +4242,34 @@ class FH_UltimateBot(ctk.CTk):
     # ==========================================
     # --- 模块：跑图前置与循环跑图 ---
     # ==========================================
+    def find_skill_race_start_position(self, race_index):
+        pos = None
+        for _ in range(60):
+            if not self.is_running:
+                return None
+
+            if self.should_abort_for_process_loss({"phase": "find_race_start", "race_index": race_index}):
+                return None
+
+            pos = self.wait_for_any_image(
+                ["start.png", "startw.png"],
+                region=self.regions["左下"],
+                threshold=0.75,
+                timeout=0.7,
+                interval=0.2,
+                fast_mode=True
+            )
+            if pos:
+                return pos
+
+            if self.should_abort_for_process_loss({"phase": "find_race_start", "race_index": race_index}):
+                return None
+
+            self.hw_press("down")
+            time.sleep(0.25)
+
+        return None
+
     def logic_race(self, target_count):
         if self.race_counter >= target_count:
             return True
@@ -4209,30 +4436,19 @@ class FH_UltimateBot(ctk.CTk):
 
             self.log(f"跑图 {self.race_counter + 1}/{target_count}: 找赛事起点...")
 
-            pos = None
-            for _ in range(60):
-                if not self.is_running:
-                    return False
+            race_start_search_at = time.time()
+            pos = self.find_skill_race_start_position(self.race_counter + 1)
 
+            if not pos:
                 if self.should_abort_for_process_loss({"phase": "find_race_start", "race_index": self.race_counter + 1}):
                     return False
-
-                pos = self.wait_for_any_image(
-                    ["start.png", "startw.png"],
-                    region=self.regions["左下"],
-                    threshold=0.75,
-                    timeout=0.7,
-                    interval=0.2,
-                    fast_mode=True
+                handled_likes = self.handle_like_prompt_after_stall(
+                    f"跑图 {self.race_counter + 1}/{target_count} 未进入下一圈",
+                    race_start_search_at,
                 )
-                if pos:
-                    break
-
-                if self.should_abort_for_process_loss({"phase": "find_race_start", "race_index": self.race_counter + 1}):
-                    return False
-
-                self.hw_press("down")
-                time.sleep(0.25)
+                if handled_likes:
+                    self.log(f"跑图 {self.race_counter + 1}/{target_count}: 点赞兜底后重新寻找赛事起点。")
+                    pos = self.find_skill_race_start_position(self.race_counter + 1)
 
             if not pos:
                 self.log("找不到赛事起点，退出跑图。")
@@ -6504,6 +6720,22 @@ class FH_UltimateBot(ctk.CTk):
             self.log("刷CR守护：赛事刷圈状态正常。")
             return True
 
+        handled_likes = self.handle_like_prompt_sequence("刷CR守护未知状态")
+        if handled_likes:
+            if self.recover_cr_known_race_state():
+                return True
+            pos = self.find_any_image(
+                ["AnnaAndLinkInFormidableAdversaryRace.png", "anna.png", "link.png"],
+                region=self.regions["左下"],
+                threshold=0.58,
+                fast_mode=True,
+            )
+            if pos:
+                self.log("刷CR守护：点赞后已回到赛事刷圈状态。")
+                return True
+            self.log("刷CR守护：已处理点赞弹窗，等待下一次守护确认当前状态。")
+            return True
+
         self.log("刷CR守护：未命中已知刷圈状态模板，已保存诊断截图。")
         self.capture_failure_snapshot("cr_unknown_race_state", module_name="cr")
         wait_seconds = self.get_config_float("cr_unknown_error_enter_interval_seconds", 5)
@@ -6579,10 +6811,19 @@ class FH_UltimateBot(ctk.CTk):
             fast_mode=True,
         )
         self.hw_press("enter")
+        settlement_return_started_at = time.time()
         time.sleep(5.0)
+        self.handle_like_prompt_sequence("刷CR周期结算后")
 
         if not self.enter_menu():
+            handled_likes = self.handle_like_prompt_after_stall(
+                "刷CR周期结算后未回主菜单",
+                settlement_return_started_at,
+            )
+            if handled_likes and self.enter_menu():
+                return True
             self.log("退出赛事后未能回到菜单")
+            self.capture_failure_snapshot("cr_exit_menu_not_found_after_settlement", module_name="cr")
             return False
         return True
 
