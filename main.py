@@ -59,7 +59,7 @@ CACHE_DIR = os.path.join(APP_DIR, "cache")
 TEMPLATE_CACHE_FILE = os.path.join(CACHE_DIR, "template_cache.pkl")
 TEMPLATE_META_FILE = os.path.join(CACHE_DIR, "template_meta.json")
 DIAGNOSTICS_DIR = os.path.join(APP_DIR, "diagnostics")
-CURRENT_VERSION = "1.1.2"
+CURRENT_VERSION = "1.1.5"
 APP_DISPLAY_NAME = "FH6Auto by YSTO | 深度优化 SArB1e"
 ORIGINAL_AUTHOR_NAME = "原作者 YSTO"
 OPTIMIZER_NAME = "深度优化者 SArB1e"
@@ -347,12 +347,12 @@ class FH_UltimateBot(ctk.CTk):
             "next_4": 1,
             "global_loops": 10,
             "skill_dirs": ["right", "up", "up", "up", "left"],
-            "share_code": "890169683",
-            "race_car_type": "s2_900",
+            "share_code": "705399298",
+            "race_car_type": "s1_790",
             "auto_restart": False,
             "restart_cmd": "start steam://run/2483190",
-            "race_stall_timeout_seconds": 120,
-            "race_restart_timeout_seconds": 300,
+            "race_stall_timeout_seconds": 60,
+            "race_restart_timeout_seconds": 150,
             "race_reverse_seconds": 3,
             "process_guard_enabled": True,
             "process_guard_interval_seconds": 120,
@@ -533,12 +533,12 @@ class FH_UltimateBot(ctk.CTk):
         if hasattr(self, "entry_race_stall_timeout"):
             self.config["race_stall_timeout_seconds"] = self.get_positive_entry_value(
                 self.entry_race_stall_timeout,
-                self.config.get("race_stall_timeout_seconds", 120),
+                self.config.get("race_stall_timeout_seconds", 60),
             )
         if hasattr(self, "entry_race_restart_timeout"):
             self.config["race_restart_timeout_seconds"] = self.get_positive_entry_value(
                 self.entry_race_restart_timeout,
-                self.config.get("race_restart_timeout_seconds", 300),
+                self.config.get("race_restart_timeout_seconds", 150),
             )
         if hasattr(self, "entry_race_reverse_seconds"):
             self.config["race_reverse_seconds"] = self.get_positive_entry_value(
@@ -1010,13 +1010,13 @@ class FH_UltimateBot(ctk.CTk):
         add_setting(
             "超时秒数",
             "race_stall_timeout_seconds",
-            120,
+            60,
             "单场刷圈开始后，如果超过这个秒数仍没检测到完成界面，就认为车辆可能卡住，先尝试倒车兜底。",
         )
         add_setting(
             "重开秒数",
             "race_restart_timeout_seconds",
-            300,
+            150,
             "单场赛事持续超过这个秒数仍未完成时，进入重开/恢复流程。建议大于或等于超时秒数。",
         )
         add_setting(
@@ -1166,7 +1166,7 @@ class FH_UltimateBot(ctk.CTk):
             box_race,
             width=110,
             height=28,
-            values=["S2 900", "S1 790"],
+            values=["S1 790", "S2 900"],
             command=self.set_race_car_type,
         )
         self.option_race_car_type.set("S1 790" if self.config.get("race_car_type") == "s1_790" else "S2 900")
@@ -1403,7 +1403,7 @@ class FH_UltimateBot(ctk.CTk):
         self.var_like_guard_enabled = ctk.BooleanVar(value=self.config.get("like_guard_enabled", True))
         self.cb_like_guard = ctk.CTkCheckBox(
             self.pipeline_tip_frame,
-            text="点赞检测",
+            text="点赞检测（尚未完整优化和测试，建议手动完成点赞）",
             variable=self.var_like_guard_enabled,
             command=self.save_config,
         )
@@ -2223,8 +2223,8 @@ class FH_UltimateBot(ctk.CTk):
                 },
                 "window_region": list(region) if region else None,
                     "config_snapshot": {
-                        "race_stall_timeout_seconds": self.config.get("race_stall_timeout_seconds", 120),
-                        "race_restart_timeout_seconds": self.config.get("race_restart_timeout_seconds", 300),
+                        "race_stall_timeout_seconds": self.config.get("race_stall_timeout_seconds", 60),
+                        "race_restart_timeout_seconds": self.config.get("race_restart_timeout_seconds", 150),
                         "race_reverse_seconds": self.config.get("race_reverse_seconds", 3),
                         "process_guard_enabled": self.config.get("process_guard_enabled", True),
                     "process_guard_interval_seconds": self.config.get("process_guard_interval_seconds", 120),
@@ -2341,6 +2341,9 @@ class FH_UltimateBot(ctk.CTk):
         self.hw_press("enter")
         time.sleep(6.0)
         self.log(f"跑图 {race_index}/{target_count}: 已发送重新开始赛事确认。")
+        # 赛事重开后回到"开始竞赛赛事"界面，按钮已高亮，按 Enter 实际开始比赛
+        self.hw_press("enter")
+        time.sleep(1.5)
         return True
 
     def is_auto_restart_enabled(self):
@@ -2760,9 +2763,21 @@ class FH_UltimateBot(ctk.CTk):
 
             pos_exit = self.find_any_image(["exit.png", "exit-b.png"], region=self.regions["左下"], threshold=0.85)
             if pos_exit:
-                self.log_recovery("识别到退出按钮，点击后继续尝试进入菜单。")
-                self.game_click(pos_exit)
-                time.sleep(1.5)
+                # 检测是否处于赛事上下文，避免在主菜单等非赛事场景误点退出导致退出游戏
+                in_race_context = self.find_any_image(
+                    ["RestartRace.png", "start.png", "startw.png", "restart.png"],
+                    region=self.regions["全界面"],
+                    threshold=0.55,
+                    fast_mode=True,
+                )
+                if in_race_context:
+                    self.log_recovery("检测到赛事上下文，点击退出并确认返回大世界。")
+                    self.game_click(pos_exit)
+                    time.sleep(1.5)
+                    self.hw_press("enter")  # 确认"是否退出比赛"
+                    time.sleep(3.0)         # 等待退出到大世界
+                else:
+                    self.log_recovery("识别到退出按钮但非赛事上下文，跳过点击，改用 ESC 返回。")
                 continue
 
             self.hw_press("esc")
@@ -3870,12 +3885,34 @@ class FH_UltimateBot(ctk.CTk):
             self.log(warning.replace("\n", " "))
             return True
 
+    def confirm_pipeline_final_check(self):
+        """强提醒之后追加的最终确认，提示用户检查关键设置。"""
+        warning = (
+            "⚠ 最终确认：\n\n"
+            "1. 请根据上方日志提示，确认已选择正确的车辆和调教。\n"
+            "2. 确认蓝图分享代码正确，蓝图已点赞。\n"
+            "3. 确认车辆调教已点赞。\n"
+            "4. 确认游戏难度已设为【所向披靡】。\n"
+            "5. 确认【自动转向】已开启。\n"
+            "6. 确认【自动换挡】已开启。\n\n"
+            "以上全部确认无误后再启动！"
+        )
+        try:
+            return bool(messagebox.askokcancel("最终确认", warning, parent=self))
+        except Exception:
+            self.log(warning.replace("\n", " "))
+            return True
+
     def start_pipeline(self, start_step):
         if self.is_running:
             return
 
         if not self.confirm_pipeline_requirements(start_step):
             self.log("用户取消启动：未确认车辆涂装/点赞前置要求。")
+            return
+
+        if not self.confirm_pipeline_final_check():
+            self.log("用户取消启动：未通过最终确认。")
             return
 
         self.is_running = True
@@ -4463,8 +4500,8 @@ class FH_UltimateBot(ctk.CTk):
             last_chk = 0
             finished = False
             stall_recovery_count = 0
-            stall_timeout = max(1, int(self.config.get("race_stall_timeout_seconds", 120)))
-            restart_timeout = max(stall_timeout, int(self.config.get("race_restart_timeout_seconds", 300)))
+            stall_timeout = max(1, int(self.config.get("race_stall_timeout_seconds", 60)))
+            restart_timeout = max(stall_timeout, int(self.config.get("race_restart_timeout_seconds", 150)))
             reverse_seconds = max(1, int(self.config.get("race_reverse_seconds", 3)))
 
             while self.is_running:
